@@ -1,0 +1,33 @@
+# 示例：把 ContextLedger 作为一个服务加进 new-api 的 docker-compose.yml。
+# 按你自己的环境修改网络名、端口和路径。
+services:
+  contextledger:
+    build:
+      context: ./contextledger/runtime   # bun run package:runtime 生成的目录
+      dockerfile: Dockerfile
+    image: contextledger:local
+    container_name: contextledger
+    restart: unless-stopped
+    networks:
+      - new-api-network                  # 和 new-api 同一个网络，插件才能访问到
+    ports:
+      - "127.0.0.1:18740:3000"           # 只暴露在本机，远程用 SSH 转发访问
+    env_file:
+      - ./contextledger/ledger.env       # 从 ledger.env.example 复制并填写
+    volumes:
+      - ./contextledger/data:/data       # 需要容器内 bun 用户（UID 1000）可写
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=16m
+    cpus: 0.5
+    mem_limit: 768m
+    pids_limit: 128
+    logging:
+      driver: json-file
+      options:
+        max-size: "2m"
+        max-file: "2"
+
+networks:
+  new-api-network:
+    external: true

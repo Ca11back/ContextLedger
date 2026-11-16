@@ -1,0 +1,25 @@
+{
+  "$schema": "https://biomejs.dev/schemas/2.6.8/schema.json",
+  "files": {
+    "includes": [
+      "src/**",
+      "scripts/**",
+      "tests/**",
+      "experiments/**",
+      "server.ts",
+      "rsbuild.config.ts",
+      "package.json",
+      "tsconfig.json",
+      "biome.json",
+      "!src/routeTree.gen.ts",
+      "!scripts/__pycache__"
+    ]
+  },
+  "formatter": { "enabled": true, "indentStyle": "space", "indentWidth": 2, "lineWidth": 100 },
+  "javascript": { "formatter": { "quoteStyle": "single" } },
+  "linter": {
+    "enabled": true,
+    "rules": { "preset": "recommended", "style": { "noNonNullAssertion": "off" } }
+  },
+  "assist": { "actions": { "source": { "organizeImports": "on" } } }
+}
