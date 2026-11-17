@@ -8,7 +8,7 @@ import { buildTranscript, type TurnView } from '../client/transcript';
 import type { ConversationDetail } from '../conversation-contracts';
 import { EmptyState, ErrorState, Loading } from './Feedback';
 import { Icon } from './Icon';
-import { LeadingHistory, Message } from './Message';
+import { LeadingHistory, MessageList } from './Message';
 import { RawBrowser, RawDrawer } from './RawDrawer';
 
 type Navigate = (next: AppSearch) => void;
@@ -63,6 +63,15 @@ export function TurnBlock({
     if (anchored) node.current?.scrollIntoView({ block: 'start' });
   }, [anchored]);
   const [copied, setCopied] = useState(false);
+  // Failed and superseded attempts fold to their head; the next turn usually resends their
+  // content. null = default (expanded only when this turn is the search hit).
+  const foldable = turn.completeness === 'error' || turn.superseded === true;
+  const [toggled, setToggled] = useState<boolean | null>(null);
+  const expanded = !foldable || (toggled ?? anchored);
+  const errorReason =
+    turn.durationMs !== null && turn.durationMs >= 60_000
+      ? `报错（${Math.round(turn.durationMs / 60_000)} 分钟后中断）`
+      : '报错（请求失败）';
   return (
     <>
       {view.reset && (
@@ -73,7 +82,7 @@ export function TurnBlock({
       <article
         ref={node}
         id={`turn-${turn.turnIndex}`}
-        className={`turn${anchored ? ' anchored' : ''}${turn.superseded ? ' superseded' : ''}`}
+        className={`turn${anchored ? ' anchored' : ''}${turn.superseded ? ' superseded' : ''}${expanded ? '' : ' collapsed'}`}
         aria-label={`第 ${turn.turnIndex} 轮${anchored ? '，搜索命中' : ''}`}
       >
         <div className="rail" aria-hidden="true">
@@ -103,7 +112,19 @@ export function TurnBlock({
             {turn.stopReason && <span title="模型给出的停止原因">停止原因 {turn.stopReason}</span>}
             {turn.retryOf ? <span className="tag quiet">重试第 {turn.retryOf} 轮</span> : null}
             {turn.completeness === 'partial' && <span className="tag warn">回复不完整</span>}
-            {turn.completeness === 'error' && <span className="tag danger">报错</span>}
+            {turn.completeness === 'error' && <span className="tag danger">{errorReason}</span>}
+            {turn.superseded && !expanded && <span className="tag quiet">已被下一轮重试取代</span>}
+            {foldable && (
+              <button
+                type="button"
+                className="link small"
+                aria-expanded={expanded}
+                aria-controls={`turn-${turn.turnIndex}-content`}
+                onClick={() => setToggled(!expanded)}
+              >
+                {expanded ? '收起' : '展开'}
+              </button>
+            )}
             <button
               type="button"
               className="link raw-link"
@@ -112,46 +133,44 @@ export function TurnBlock({
               原始数据
             </button>
           </div>
-          {turn.parentOutputIncomplete && (
-            <p className="note">
-              上一轮的回复没有完整采集。如果客户端在这次请求里带上了它收到的回复，会出现在下面开头，可能和上一轮重复。
-            </p>
-          )}
-          {carried.length > 0 && (
-            <LeadingHistory
-              messages={carried}
-              label={view.reset ? '变化后的上下文' : '首条请求携带的历史'}
-              pendingId={pendingId}
-            />
-          )}
-          {own.map((message) => (
-            <Message
-              key={message.messageId}
-              message={message}
-              pending={message.messageId === pendingId}
-            />
-          ))}
-          {turn.superseded ? (
-            <p className="note">
-              {turn.completeness === 'error'
-                ? '这次请求失败，'
-                : turn.completeness === 'partial'
-                  ? '这次回复没有完整采集，'
-                  : ''}
-              客户端在后面用同样的内容重试了。
-            </p>
-          ) : (
-            <>
-              {turn.completeness === 'partial' && (
+          {expanded && (
+            <div className="turn-content" id={`turn-${turn.turnIndex}-content`}>
+              {turn.parentOutputIncomplete && (
                 <p className="note">
-                  回复没有完整采集。如果客户端在后续请求里带上了它收到的回复，会出现在下一轮开头。
+                  上一轮的回复没有完整采集。如果客户端在这次请求里带上了它收到的回复，会出现在下面开头，可能和上一轮重复。
                 </p>
               )}
-              {turn.completeness === 'error' &&
-                own.every((message) => message.side === 'input') && (
-                  <p className="note">这次请求报错，没有收到回复内容。详情见原始数据。</p>
-                )}
-            </>
+              {carried.length > 0 && (
+                <LeadingHistory
+                  messages={carried}
+                  label={view.reset ? '变化后的上下文' : '首条请求携带的历史'}
+                  pendingId={pendingId}
+                />
+              )}
+              <MessageList messages={own} pendingId={pendingId} />
+              {turn.superseded ? (
+                <p className="note">
+                  {turn.completeness === 'error'
+                    ? '这次请求失败，'
+                    : turn.completeness === 'partial'
+                      ? '这次回复没有完整采集，'
+                      : ''}
+                  客户端在后面用同样的内容重试了。
+                </p>
+              ) : (
+                <>
+                  {turn.completeness === 'partial' && (
+                    <p className="note">
+                      回复没有完整采集。如果客户端在后续请求里带上了它收到的回复，会出现在下一轮开头。
+                    </p>
+                  )}
+                  {turn.completeness === 'error' &&
+                    own.every((message) => message.side === 'input') && (
+                      <p className="note">这次请求报错，没有收到回复内容。详情见原始数据。</p>
+                    )}
+                </>
+              )}
+            </div>
           )}
         </div>
       </article>

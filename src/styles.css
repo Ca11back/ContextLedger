@@ -535,7 +535,7 @@ fieldset {
   font: 600 10px var(--mono);
 }
 /* Dim the superseded attempt's content; head and retry note stay at full contrast. */
-.turn.superseded .turn-body > :not(.turn-head):not(.note) {
+.turn.superseded .turn-content > :not(.note) {
   opacity: 0.6;
 }
 .turn.superseded .node {
@@ -565,6 +565,13 @@ fieldset {
 .turn-label {
   color: var(--ink);
   font-size: 13px;
+}
+/* Failed and superseded attempts fold to one line until expanded. */
+.turn.collapsed .turn-body {
+  padding-bottom: 4px;
+}
+.turn.collapsed .turn-head {
+  margin-bottom: 0;
 }
 .found {
   background: var(--ink);
@@ -619,6 +626,10 @@ fieldset {
   border: 1px solid var(--rule);
   border-radius: 10px;
   padding: 10px 14px;
+}
+.reasoning-run {
+  border-left: 2px solid var(--rule);
+  padding-left: 12px;
 }
 .msg-reasoning .text,
 .msg-refusal .text {

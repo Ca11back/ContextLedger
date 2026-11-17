@@ -169,6 +169,66 @@ export function Message({ message, pending = false }: { message: MessageView; pe
   );
 }
 
+/**
+ * A reasoning message with nothing readable: no parts or only blank text (e.g. encrypted
+ * reasoning without a summary). A message whose parts may still arrive is never empty.
+ */
+function emptyReasoning(message: MessageView, pending: boolean) {
+  return (
+    message.kind === 'reasoning' &&
+    !pending &&
+    !message.alternatives &&
+    !message.media &&
+    message.parts.every((part) => !part.continuation && part.text.trim() === '')
+  );
+}
+
+type MessageRun =
+  | { type: 'message'; message: MessageView }
+  | { type: 'reasoning'; key: string; count: number };
+
+/** Groups consecutive empty reasoning messages into one run; everything else stays as is. */
+export function groupMessages(messages: readonly MessageView[], pendingId?: string): MessageRun[] {
+  const runs: MessageRun[] = [];
+  for (const message of messages) {
+    if (!emptyReasoning(message, message.messageId === pendingId)) {
+      runs.push({ type: 'message', message });
+      continue;
+    }
+    const last = runs.at(-1);
+    if (last?.type === 'reasoning') last.count += 1;
+    else runs.push({ type: 'reasoning', key: message.messageId, count: 1 });
+  }
+  return runs;
+}
+
+/** Messages in order, with runs of empty reasoning merged into one muted line. */
+export function MessageList({
+  messages,
+  pendingId,
+}: {
+  messages: readonly MessageView[];
+  pendingId?: string;
+}) {
+  return (
+    <>
+      {groupMessages(messages, pendingId).map((run) =>
+        run.type === 'message' ? (
+          <Message
+            key={run.message.messageId}
+            message={run.message}
+            pending={run.message.messageId === pendingId}
+          />
+        ) : (
+          <p className="msg reasoning-run muted small" key={run.key}>
+            模型思考了 {run.count.toLocaleString()} 步（内容已加密，未记录）
+          </p>
+        ),
+      )}
+    </>
+  );
+}
+
 export function LeadingHistory({
   messages,
   label,
@@ -189,14 +249,7 @@ export function LeadingHistory({
           {open ? '收起' : '展开'}
         </button>
       </div>
-      {open &&
-        messages.map((message) => (
-          <Message
-            key={message.messageId}
-            message={message}
-            pending={message.messageId === pendingId}
-          />
-        ))}
+      {open && <MessageList messages={messages} pendingId={pendingId} />}
     </div>
   );
 }

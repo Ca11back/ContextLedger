@@ -108,6 +108,7 @@ test('superseded attempts are dimmed with a retry note and retries are labelled'
     media: false,
     ...extra,
   });
+  // Anchored, so the folded attempts start expanded and show their notes.
   const renderTurn = (summary: TurnSummary) => {
     const client = createDashboardQueryClient();
     try {
@@ -115,7 +116,7 @@ test('superseded attempts are dimmed with a retry note and retries are labelled'
         <QueryClientProvider client={client}>
           <TurnBlock
             view={{ turn: summary, reset: null, messages: [] }}
-            anchored={false}
+            anchored
             openRaw={() => {}}
             spurs={[]}
             go={() => {}}
@@ -128,7 +129,7 @@ test('superseded attempts are dimmed with a retry note and retries are labelled'
     }
   };
   const failed = renderTurn(turn(1, { completeness: 'error', superseded: true }));
-  expect(failed).toContain('turn superseded');
+  expect(failed).toContain('anchored superseded');
   expect(failed).toContain('这次请求失败，');
   expect(failed).toContain('客户端在后面用同样的内容重试了');
   expect(failed).not.toContain('这次请求报错，没有收到回复内容');
@@ -206,4 +207,145 @@ test('only the last message of an open stream is still loading', () => {
   const ended = renderTurn(false);
   expect(ended.split('这段内容没有返回').length - 1).toBe(2);
   expect(ended).not.toContain('正在载入…');
+});
+
+function summaryOf(extra: Partial<TurnSummary>): TurnSummary {
+  return {
+    turnIndex: 6,
+    recordId: 24,
+    requestId: 'req-6',
+    receivedAt: 0,
+    model: 'm',
+    inputTokens: 26,
+    outputTokens: 10,
+    charge: null,
+    durationMs: null,
+    completeness: 'complete',
+    linkRule: 'prefix',
+    parentOutputIncomplete: false,
+    contextReset: null,
+    media: false,
+    ...extra,
+  };
+}
+
+function renderTurnView(summary: TurnSummary, messages: MessageView[], anchored = false) {
+  const client = createDashboardQueryClient();
+  try {
+    return renderToStaticMarkup(
+      <QueryClientProvider client={client}>
+        <TurnBlock
+          view={{ turn: summary, reset: null, messages }}
+          anchored={anchored}
+          openRaw={() => {}}
+          spurs={[{ id: 9, title: 'branch' }]}
+          go={() => {}}
+          search={{}}
+        />
+      </QueryClientProvider>,
+    );
+  } finally {
+    client.clear();
+  }
+}
+
+const reply: MessageView = {
+  ...base,
+  messageId: 'reply',
+  kind: 'assistant',
+  side: 'output',
+  parts: [
+    { partIndex: 0, partKind: 'text', partTotal: 14, text: 'partial answer', continuation: null },
+  ],
+};
+
+test('error turns are one line by default and open expanded when anchored', () => {
+  const summary = summaryOf({ completeness: 'error', durationMs: 901_600 });
+  const folded = renderTurnView(summary, [reply]);
+  expect(folded).toContain('turn collapsed');
+  expect(folded).toContain('报错（15 分钟后中断）');
+  expect(folded).toContain('aria-expanded="false"');
+  expect(folded).toContain('>展开<');
+  expect(folded).toContain('原始数据');
+  expect(folded).not.toContain('partial answer');
+  expect(folded).toContain('会话 #9');
+  const anchored = renderTurnView(summary, [reply], true);
+  expect(anchored).not.toContain('collapsed');
+  expect(anchored).toContain('partial answer');
+  expect(anchored).toContain('>收起<');
+  const quick = renderTurnView(summaryOf({ completeness: 'error', durationMs: 3_000 }), []);
+  expect(quick).toContain('报错（请求失败）');
+});
+
+test('superseded turns are folded to their head', () => {
+  const html = renderTurnView(summaryOf({ superseded: true }), [reply]);
+  expect(html).toContain('turn superseded collapsed');
+  expect(html).toContain('已被下一轮重试取代');
+  expect(html).not.toContain('partial answer');
+  expect(html).not.toContain('客户端在后面用同样的内容重试了');
+  const complete = renderTurnView(summaryOf({}), [reply]);
+  expect(complete).not.toContain('collapsed');
+  expect(complete).not.toContain('aria-expanded');
+  expect(complete).toContain('partial answer');
+});
+
+test('consecutive empty reasoning merges into one line; reasoning with text is unchanged', () => {
+  const empty = (index: number): MessageView => ({
+    ...base,
+    messageId: `r${index}`,
+    kind: 'reasoning',
+    side: 'output',
+    partCount: index % 2 ? 0 : 1,
+    parts:
+      index % 2
+        ? []
+        : [{ partIndex: 0, partKind: 'text', partTotal: 2, text: ' \n', continuation: null }],
+  });
+  const runs = Array.from({ length: 16 }, (_, index) => empty(index));
+  const thought: MessageView = {
+    ...base,
+    messageId: 'thought',
+    kind: 'reasoning',
+    side: 'output',
+    parts: [
+      { partIndex: 0, partKind: 'text', partTotal: 12, text: 'Check config', continuation: null },
+    ],
+  };
+  const html = renderTurnView(summaryOf({}), [...runs, thought, empty(99), reply]);
+  expect(html.split('模型思考了').length - 1).toBe(2);
+  expect(html).toContain('模型思考了 16 步（内容已加密，未记录）');
+  expect(html).toContain('模型思考了 1 步（内容已加密，未记录）');
+  expect(html).toContain('Check config');
+  expect(html.split('思考摘要').length - 1).toBe(1);
+  expect(html).toContain('partial answer');
+});
+
+test('a pending reasoning message is not counted as empty', () => {
+  const pending: MessageView = {
+    ...base,
+    messageId: 'last',
+    kind: 'reasoning',
+    side: 'output',
+    parts: [],
+  };
+  const client = createDashboardQueryClient();
+  try {
+    const html = renderToStaticMarkup(
+      <QueryClientProvider client={client}>
+        <TurnBlock
+          view={{ turn: summaryOf({}), reset: null, messages: [pending] }}
+          anchored={false}
+          openRaw={() => {}}
+          spurs={[]}
+          go={() => {}}
+          search={{}}
+          streamOpen
+        />
+      </QueryClientProvider>,
+    );
+    expect(html).not.toContain('模型思考了');
+    expect(html).toContain('正在载入…');
+  } finally {
+    client.clear();
+  }
 });
