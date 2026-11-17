@@ -45,7 +45,26 @@ function chatMessage(value: unknown, completed = true): NormalizedMessage[] {
       ),
     );
   }
-  for (const normalized of result) normalized.evidence &&= knownAssistantContent(item.content);
+  for (const normalized of result) {
+    normalized.evidence &&= knownAssistantContent(item.content);
+    normalized.prefixKnown =
+      item.content === null ||
+      item.content === undefined ||
+      typeof item.content === 'string' ||
+      (Array.isArray(item.content) &&
+        item.content.every((value) =>
+          [
+            'text',
+            'input_text',
+            'output_text',
+            'refusal',
+            'image_url',
+            'input_image',
+            'input_audio',
+            'input_file',
+          ].includes(string(object(value).type)),
+        ));
+  }
   if (typeof item.refusal === 'string' && item.refusal.length)
     result.push(
       message(

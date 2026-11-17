@@ -16,6 +16,12 @@ export interface NormalizedPart {
   kind: 'text' | 'json';
   text: string;
 }
+export interface AnnouncedOutputItem {
+  index: number;
+  type: string;
+  idHash: string;
+  completedHash?: string;
+}
 /** Ephemeral derived view. Never persisted as a second copy of the evidence. */
 export interface NormalizedMessage {
   side: 'input' | 'output';
@@ -30,6 +36,13 @@ export interface NormalizedMessage {
   parts: NormalizedPart[];
   /** Actual source user text only, bounded to 120 UTF-16 units; never display placeholders. */
   userText: string;
+  /** Responses-only source shell metadata; never extracted from user payloads. */
+  wireItemType?: string;
+  itemIdHash?: string;
+  /** Actual captured Responses output_index, retained to detect missing items. */
+  outputIndex?: number;
+  /** False when a known shell contains unknown content that cannot prove a prefix. */
+  prefixKnown?: boolean;
   /** Full, uncapped per-format identity projection hash; never hashes display labels. */
   itemHash: string;
   completed: boolean;
@@ -44,6 +57,8 @@ export interface NormalizedRequest {
   tokenId: string | null;
   identity: DeclaredIdentity | null;
   completeness: Completeness;
+  announcedOutput: AnnouncedOutputItem[];
+  announcementsValid: boolean;
   input: NormalizedMessage[];
   output: NormalizedMessage[];
   /** Complete output, or completed meaningful assistant/tool calls for a partial capture. */

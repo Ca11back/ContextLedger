@@ -364,6 +364,14 @@ fieldset {
 .sentinel {
   min-height: 24px;
 }
+.load-more {
+  display: block;
+  margin: 12px auto;
+  color: var(--muted);
+}
+.load-more:hover {
+  color: var(--lineage);
+}
 .state {
   padding: 28px 20px;
   color: var(--muted);

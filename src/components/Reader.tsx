@@ -3,6 +3,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { charge, clock, count, dateTime, duration, shortId, tokens } from '../client/format';
 import { conversationQuery, fragmentsQuery, recordViewQuery } from '../client/queries';
 import type { AppSearch } from '../client/search';
+import { useSentinel } from '../client/sentinel';
 import { buildTranscript, type TurnView } from '../client/transcript';
 import type { ConversationDetail } from '../conversation-contracts';
 import { EmptyState, ErrorState, Loading } from './Feedback';
@@ -23,11 +24,15 @@ function useFragments(id: number, startTurn: number | undefined, untilTurn?: num
     () => query.data?.pages.flatMap((page) => page.fragments) ?? [],
     [query.data],
   );
-  const turns = useMemo(() => {
+  const { turns, lastSeen } = useMemo(() => {
     const all = buildTranscript(fragments);
-    return untilTurn === undefined ? all : all.filter((turn) => turn.turn.turnIndex <= untilTurn);
+    const lastSeen = all.at(-1)?.turn.turnIndex ?? 0;
+    return {
+      lastSeen,
+      turns: untilTurn === undefined ? all : all.filter((turn) => turn.turn.turnIndex <= untilTurn),
+    };
   }, [fragments, untilTurn]);
-  return { query, turns };
+  return { query, turns, lastSeen };
 }
 
 export function TurnBlock({
@@ -37,6 +42,7 @@ export function TurnBlock({
   spurs,
   go,
   search,
+  streamOpen = false,
 }: {
   view: TurnView;
   anchored: boolean;
@@ -44,8 +50,12 @@ export function TurnBlock({
   spurs: { id: number; title: string }[];
   go: Navigate;
   search: AppSearch;
+  /** The fragments stream may still continue this turn (last turn received, more pages). */
+  streamOpen?: boolean;
 }) {
   const { turn } = view;
+  // Only the last message received can still get its first chunks; the stream is ordered.
+  const pendingId = streamOpen ? view.messages.at(-1)?.messageId : undefined;
   const carried = view.messages.filter((message) => message.leadingHistory);
   const own = view.messages.filter((message) => !message.leadingHistory);
   const node = useRef<HTMLElement>(null);
@@ -111,10 +121,15 @@ export function TurnBlock({
             <LeadingHistory
               messages={carried}
               label={view.reset ? '变化后的上下文' : '首条请求携带的历史'}
+              pendingId={pendingId}
             />
           )}
           {own.map((message) => (
-            <Message key={message.messageId} message={message} />
+            <Message
+              key={message.messageId}
+              message={message}
+              pending={message.messageId === pendingId}
+            />
           ))}
           {turn.superseded ? (
             <p className="note">
@@ -227,17 +242,19 @@ function InheritedBody({
   go: Navigate;
   search: AppSearch;
 }) {
-  const { query, turns } = useFragments(id, undefined, until);
-  const last = turns.at(-1)?.turn.turnIndex ?? 0;
-  const { hasNextPage, isFetchingNextPage, fetchNextPage } = query;
+  const { query, turns, lastSeen } = useFragments(id, undefined, until);
+  const { hasNextPage, isFetching, isFetchNextPageError, fetchNextPage } = query;
+  // Keep reading until a turn after `until` appears, so the last inherited turn is complete.
+  const more = lastSeen <= until && hasNextPage;
   useEffect(() => {
-    if (last < until && hasNextPage && !isFetchingNextPage) void fetchNextPage();
-  }, [last, until, hasNextPage, isFetchingNextPage, fetchNextPage]);
+    if (more && !isFetching && !isFetchNextPageError) void fetchNextPage();
+  }, [more, isFetching, isFetchNextPageError, fetchNextPage]);
   if (query.isPending) return <Loading label="正在载入继承的轮次…" />;
-  if (query.isError) return <ErrorState error={query.error} retry={() => void query.refetch()} />;
+  if (query.isError && !query.data)
+    return <ErrorState error={query.error} retry={() => void query.refetch()} />;
   return (
     <div className="inherited-body">
-      {turns.map((view) => (
+      {turns.map((view, index) => (
         <TurnBlock
           key={view.turn.turnIndex}
           view={view}
@@ -246,8 +263,14 @@ function InheritedBody({
           spurs={[]}
           go={go}
           search={search}
+          streamOpen={more && index === turns.length - 1}
         />
       ))}
+      {more && isFetchNextPageError && !isFetching && (
+        <button type="button" className="link small load-more" onClick={() => void fetchNextPage()}>
+          继续载入
+        </button>
+      )}
     </div>
   );
 }
@@ -361,18 +384,15 @@ export function ConversationReader({
   const [raw, setRaw] = useState<{ recordId: number; title: string } | null>(null);
   const openRaw = useCallback((recordId: number, title: string) => setRaw({ recordId, title }), []);
   const closeRaw = useCallback(() => setRaw(null), []);
-  const sentinel = useRef<HTMLDivElement>(null);
   const { hasNextPage, isFetchingNextPage, fetchNextPage } = query;
-  useEffect(() => {
-    const node = sentinel.current;
-    if (!node || !hasNextPage) return;
-    const observer = new IntersectionObserver((entries) => {
-      if (entries.some((entry) => entry.isIntersecting) && !isFetchingNextPage)
-        void fetchNextPage();
-    });
-    observer.observe(node);
-    return () => observer.disconnect();
-  }, [hasNextPage, isFetchingNextPage, fetchNextPage]);
+  const loadNext = useCallback(() => void fetchNextPage(), [fetchNextPage]);
+  // Callback-ref sentinel: attaches when the node mounts, even if detail resolves after fragments.
+  const sentinel = useSentinel({
+    hasNextPage,
+    isFetching: query.isFetching,
+    failed: query.isFetchNextPageError,
+    load: loadNext,
+  });
   // [ and ] jump between turns outside text inputs.
   useEffect(() => {
     const onKey = (event: KeyboardEvent) => {
@@ -422,12 +442,12 @@ export function ConversationReader({
         )}
         {query.isPending ? (
           <Loading label="正在载入对话内容…" />
-        ) : query.isError ? (
+        ) : query.isError && !query.data ? (
           <ErrorState error={query.error} retry={() => void query.refetch()} />
         ) : turns.length === 0 ? (
           <EmptyState title="这段会话没有可显示的内容" />
         ) : (
-          turns.map((view) => (
+          turns.map((view, index) => (
             <TurnBlock
               key={view.turn.turnIndex}
               view={view}
@@ -436,11 +456,17 @@ export function ConversationReader({
               spurs={spursAt.get(view.turn.turnIndex) ?? []}
               go={go}
               search={search}
+              streamOpen={hasNextPage && index === turns.length - 1}
             />
           ))
         )}
-        <div ref={sentinel} className="sentinel">
+        <div ref={sentinel.ref} className="sentinel">
           {isFetchingNextPage && <Loading label="正在载入后面的内容…" />}
+          {sentinel.showManual && (
+            <button type="button" className="link small load-more" onClick={loadNext}>
+              继续载入
+            </button>
+          )}
           {!hasNextPage && turns.length > 0 && <p className="end">会话到这里结束。</p>}
         </div>
       </div>

@@ -186,11 +186,18 @@ export function claude(
   }
   const ordered = [...states].sort(([a], [b]) => a - b);
   invalid ||= ordered.some(([index, state], i) => index !== i || !state.stopped || state.invalid);
-  const output = ordered.map(([, state]) => {
+  const output = ordered.map(([index, state]) => {
     if (state.hasJson && !state.stopped)
-      return block({ ...state.value, input: state.json }, 'assistant', false);
+      return {
+        ...block({ ...state.value, input: state.json }, 'assistant', false),
+        outputIndex: index,
+      };
     const result = block(state.value, 'assistant', state.stopped && !state.invalid);
-    if (state.invalid) result.evidence = false;
+    result.outputIndex = index;
+    if (state.invalid) {
+      result.evidence = false;
+      result.prefixKnown = false;
+    }
     return result;
   });
   return {

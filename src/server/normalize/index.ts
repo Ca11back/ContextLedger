@@ -10,6 +10,7 @@ import type { NormalizedMessage, NormalizedRequest } from './types';
 
 export { canonicalJson, chainHashes } from './common';
 export type {
+  AnnouncedOutputItem,
   Completeness,
   MessageKind,
   NormalizedMessage,
@@ -19,7 +20,26 @@ export type {
 
 const chatProtocols = new Set(['openai', 'openai_responses', 'claude', 'gemini']);
 function hasContent(messages: NormalizedMessage[]): boolean {
-  return messages.some((m) => m.evidence && m.parts.some((p) => p.text.length > 0));
+  return messages.some(
+    (m) =>
+      (m.kind === 'assistant' || m.kind === 'tool_call') &&
+      m.evidence &&
+      m.parts.some((p) => p.text.length > 0),
+  );
+}
+function completedPrefix(output: NormalizedMessage[]): NormalizedMessage[] {
+  const prefix: NormalizedMessage[] = [];
+  for (const [i, m] of output.entries()) {
+    if (
+      !m.completed ||
+      m.kind === 'other' ||
+      m.prefixKnown === false ||
+      (m.outputIndex !== undefined && m.outputIndex !== i)
+    )
+      break;
+    prefix.push(m);
+  }
+  return prefix;
 }
 export function leadingHistoryCount(input: NormalizedMessage[]): number {
   // A trailing tool result follows the assistant tool call; keep all parallel results together.
@@ -75,11 +95,7 @@ export function normalizeEnvelope(envelope: Envelope): NormalizedRequest {
     userText: '',
   }));
   const evidence =
-    completeness === 'error'
-      ? []
-      : completeness === 'complete'
-        ? output
-        : output.filter((m) => m.completed && m.evidence);
+    completeness === 'error' ? [] : completeness === 'complete' ? output : completedPrefix(output);
   const domain = isolationDomain(envelope, protocol);
   const previousResponseId =
     protocol === 'openai_responses' &&
@@ -101,14 +117,22 @@ export function normalizeEnvelope(envelope: Envelope): NormalizedRequest {
   const lastUserText = input.reduce((latest, m) => m.userText || latest, '');
   const titleText =
     input.slice(leading).find((m) => m.userText.length > 0)?.userText ?? lastUserText;
+  const identity = chatProtocols.has(protocol) ? parseCodexIdentity(body, domain) : null;
+  const announcementsValid =
+    completeness === 'partial' &&
+    identity !== null &&
+    !previousResponseId &&
+    adapted.announcementsValid === true;
   return {
     protocol,
     chat: chatProtocols.has(protocol),
     domain,
     userId: identityId(object(report.user).id),
     tokenId: identityId(object(report.token).id),
-    identity: chatProtocols.has(protocol) ? parseCodexIdentity(body, domain) : null,
+    identity,
     completeness,
+    announcedOutput: announcementsValid ? (adapted.announcedOutput ?? []) : [],
+    announcementsValid,
     input,
     output,
     evidence,

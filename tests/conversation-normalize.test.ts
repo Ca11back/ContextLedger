@@ -348,7 +348,7 @@ test('Claude invalid JSON stays unparsed and partial even after terminal; comple
   expect(result.completeness).toBe('partial');
   expect(result.output[2]!.parts[0]!.text).toContain('broken');
   expect(result.output[2]!.parts[0]!.kind).toBe('text');
-  expect(result.evidence.map((m) => m.kind)).toEqual(['assistant']);
+  expect(result.evidence.map((m) => m.kind)).toEqual(['reasoning', 'assistant']);
 });
 
 test('Claude missing block stops cannot be trusted; whole unknown/server result/redacted blocks stay readable', () => {
@@ -953,4 +953,248 @@ test('previous-response retries retain a full input fingerprint without introduc
   expect(empty.retryInputChain).toHaveLength(64);
   expect(empty.retryInputChain).toBe(normalize('openai_responses', { input: [] }).retryInputChain);
   expect(empty.retryInputChain).not.toBe(one.retryInputChain);
+});
+
+function declaredPartial(events: unknown[], input: unknown[] = [user]) {
+  return normalize(
+    'openai_responses',
+    {
+      input,
+      client_metadata: {
+        'x-codex-turn-metadata': JSON.stringify({ thread_id: 'thread' }),
+      },
+    },
+    { stream: true, truncated: true, events },
+  );
+}
+const reasoningDone = { type: 'reasoning', id: 'reasoning-id', summary: [] };
+const toolDone = {
+  type: 'function_call',
+  id: 'tool-item-id',
+  call_id: 'call-id',
+  name: 'tool',
+  arguments: '{"user":{"id":"payload-id"}}',
+  status: 'completed',
+};
+const addedItem = (index: number, item: unknown) =>
+  event('response.output_item.added', { output_index: index, item });
+const doneItem = (index: number, item: unknown) =>
+  event('response.output_item.done', { output_index: index, item });
+
+test('partial 41→42 keeps empty reasoning and completed tool in exact ordered prefix', () => {
+  const parent = declaredPartial([doneItem(0, reasoningDone), doneItem(1, toolDone)]);
+  const child = normalize('openai_responses', {
+    input: [
+      user,
+      reasoningDone,
+      toolDone,
+      { type: 'function_call_output', call_id: 'call-id', output: 'result' },
+    ],
+  });
+  expect(parent.evidence.map((m) => m.kind)).toEqual(['reasoning', 'tool_call']);
+  expect(parent.evidenceCount).toBe(3);
+  expect(parent.evidenceChain).toBe(child.inputPrefixes[2]);
+  const onlyReasoning = declaredPartial([doneItem(0, reasoningDone)]);
+  expect(onlyReasoning.evidence).toHaveLength(1);
+  expect(onlyReasoning.evidenceChain).toBeNull();
+});
+
+test('partial prefix never crosses an unfinished, unknown, missing or malformed output item', () => {
+  const first = responseMessage('known first');
+  const cases = [
+    [doneItem(0, { ...reasoningDone, status: 'incomplete' }), doneItem(1, toolDone)],
+    [doneItem(0, { type: 'future_item', id: 'unknown' }), doneItem(1, toolDone)],
+    [
+      doneItem(0, { ...reasoningDone, summary: { type: 'future_summary', text: 'unknown' } }),
+      doneItem(1, toolDone),
+    ],
+    [
+      doneItem(0, {
+        type: 'message',
+        role: 'assistant',
+        content: { type: 'future_content', text: 'unknown' },
+      }),
+      doneItem(1, toolDone),
+    ],
+    [doneItem(1, toolDone)],
+    [doneItem(0, reasoningDone), doneItem(2, toolDone)],
+    [
+      doneItem(0, {
+        type: 'message',
+        role: 'assistant',
+        content: [{ type: 'future_text', text: 'unknown' }],
+      }),
+      doneItem(1, toolDone),
+    ],
+  ];
+  for (const events of cases) expect(declaredPartial(events).evidenceChain).toBeNull();
+  const result = declaredPartial([doneItem(0, first), doneItem(2, toolDone)]);
+  expect(result.output.map((m) => m.outputIndex)).toEqual([0, 2]);
+  expect(result.evidence).toHaveLength(1);
+  expect(result.evidence[0]!.parts[0]!.text).toBe('known first');
+  const child = normalize('openai_responses', { input: [user, first] });
+  expect(result.evidenceChain).toBe(child.inputPrefixes[1]);
+});
+
+test('added-only 42 shape announces full ordered ids without inventing completed output', () => {
+  const events = [addedItem(0, reasoningDone), addedItem(1, { ...toolDone, arguments: '' })];
+  const bodyBefore = JSON.stringify(events);
+  const parent = declaredPartial(events);
+  expect(parent.announcementsValid).toBe(true);
+  expect(parent.output).toHaveLength(0);
+  expect(parent.evidenceChain).toBeNull();
+  expect(parent.announcedOutput.map((m) => [m.index, m.type, m.completedHash])).toEqual([
+    [0, 'reasoning', undefined],
+    [1, 'function_call', undefined],
+  ]);
+  const child = normalize('openai_responses', { input: [user, reasoningDone, toolDone] });
+  for (const item of parent.announcedOutput) {
+    expect(item.idHash).toHaveLength(64);
+    expect(child.input[item.index + 1]!.itemIdHash).toBe(item.idHash);
+    expect(child.input[item.index + 1]!.wireItemType).toBe(item.type);
+  }
+  expect(JSON.stringify(parent.announcedOutput)).not.toContain('tool-item-id');
+  expect(JSON.stringify(events)).toBe(bodyBefore);
+});
+
+test('completed announcement hashes compare full identity, including edited tool payload', () => {
+  const parent = declaredPartial([
+    addedItem(0, reasoningDone),
+    doneItem(0, reasoningDone),
+    addedItem(1, { ...toolDone, arguments: '' }),
+    doneItem(1, toolDone),
+  ]);
+  expect(parent.announcementsValid).toBe(true);
+  const same = normalize('openai_responses', { input: [reasoningDone, toolDone] });
+  const edited = normalize('openai_responses', {
+    input: [reasoningDone, { ...toolDone, arguments: 'edited' }],
+  });
+  expect(parent.announcedOutput[0]!.completedHash).toBe(same.input[0]!.itemHash);
+  expect(parent.announcedOutput[1]!.completedHash).toBe(same.input[1]!.itemHash);
+  expect(parent.announcedOutput[1]!.idHash).toBe(edited.input[1]!.itemIdHash!);
+  expect(parent.announcedOutput[1]!.completedHash).not.toBe(edited.input[1]!.itemHash);
+});
+
+test('invalid announcement lists disable whole path rather than truncating to a usable prefix', () => {
+  const cases = [
+    [addedItem(1, reasoningDone)],
+    [addedItem(0, reasoningDone), addedItem(2, toolDone)],
+    [addedItem(0, reasoningDone), addedItem(0, toolDone)],
+    [addedItem(0, reasoningDone), addedItem(1, { ...toolDone, id: reasoningDone.id })],
+    [addedItem(0, { type: 'reasoning', summary: [] })],
+    [addedItem(0, { ...reasoningDone, id: '' })],
+    [addedItem(0, { ...reasoningDone, id: 'x'.repeat(513) })],
+    [addedItem(0, { ...reasoningDone, type: 'future_item' })],
+    [addedItem(0, reasoningDone), doneItem(0, { ...reasoningDone, id: 'mismatch' })],
+    [addedItem(0, reasoningDone), doneItem(0, { ...reasoningDone, type: 'message' })],
+    [addedItem(0, reasoningDone), doneItem(0, reasoningDone), doneItem(0, reasoningDone)],
+    [addedItem(0, reasoningDone), event('response.output_item.done', { output_index: 0 })],
+    [doneItem(0, reasoningDone), addedItem(0, reasoningDone)],
+    Array.from({ length: 257 }, (_, i) => addedItem(i, { ...reasoningDone, id: `id-${i}` })),
+  ];
+  for (const events of cases) {
+    const result = declaredPartial(events);
+    expect(result.announcementsValid).toBe(false);
+    expect(result.announcedOutput).toEqual([]);
+  }
+});
+
+test('announcement metadata is bounded and unavailable for error, undeclared or previous-id paths', () => {
+  const events = Array.from({ length: 256 }, (_, i) =>
+    addedItem(i, { ...reasoningDone, id: `${i}${'x'.repeat(500)}` }),
+  );
+  const parent = declaredPartial(events);
+  expect(parent.announcementsValid).toBe(true);
+  expect(parent.announcedOutput).toHaveLength(256);
+  expect(Buffer.byteLength(JSON.stringify(parent.announcedOutput))).toBeLessThanOrEqual(65_536);
+  const undeclared = normalize('openai_responses', { input: [user] }, { events, truncated: true });
+  expect(undeclared.announcementsValid).toBe(false);
+  const raw = envelope(
+    'openai_responses',
+    {
+      input: [user],
+      client_metadata: {
+        'x-codex-turn-metadata': JSON.stringify({ thread_id: 'thread' }),
+      },
+    },
+    { events, status: 502 },
+  );
+  expect(normalizeEnvelope(raw).announcedOutput).toEqual([]);
+  raw.report.response = { events, truncated: true };
+  (raw.report.request as { body: Record<string, unknown> }).body.previous_response_id = 'previous';
+  expect(normalizeEnvelope(raw).announcementsValid).toBe(false);
+});
+
+test('known Responses shell ids remain separate from nested user id payloads', () => {
+  const input = normalize('openai_responses', {
+    input: [
+      { ...toolDone, arguments: { id: 'payload-id' } },
+      { type: 'future_item', id: 'unknown-id' },
+      { role: 'user', content: 'literal id: tool-item-id' },
+    ],
+  }).input;
+  expect(input[0]!.itemIdHash).toHaveLength(64);
+  expect(input[0]!.wireItemType).toBe('function_call');
+  expect(input[1]!.itemIdHash).toBeUndefined();
+  expect(input[2]!.itemIdHash).toBeUndefined();
+});
+
+test('partial body completed items add full announced identity and reject conflicting captured completions', () => {
+  const body = {
+    input: [user],
+    client_metadata: { 'x-codex-turn-metadata': JSON.stringify({ thread_id: 'thread' }) },
+  };
+  const added = addedItem(0, { ...toolDone, arguments: '', status: 'in_progress' });
+  const result = normalize('openai_responses', body, {
+    truncated: true,
+    body: { status: 'incomplete', output: [toolDone] },
+    events: [added],
+  });
+  expect(result.output[0]!.completed).toBe(true);
+  expect(result.announcementsValid).toBe(true);
+  expect(result.announcedOutput[0]!.completedHash).toBe(result.output[0]!.itemHash);
+  const conflicting = normalize('openai_responses', body, {
+    truncated: true,
+    body: { status: 'incomplete', output: [{ ...toolDone, arguments: 'different' }] },
+    events: [added, doneItem(0, toolDone)],
+  });
+  expect(conflicting.announcementsValid).toBe(false);
+  expect(conflicting.announcedOutput).toEqual([]);
+  const missingId = normalize('openai_responses', body, {
+    truncated: true,
+    body: { status: 'incomplete', output: [{ ...toolDone, id: undefined }] },
+    events: [added],
+  });
+  expect(missingId.announcementsValid).toBe(false);
+});
+
+test('partial Chat prefix stops at unknown content before later completed tool calls', () => {
+  const result = normalize(
+    'openai',
+    { messages: [user] },
+    {
+      truncated: true,
+      body: {
+        choices: [
+          {
+            message: {
+              role: 'assistant',
+              content: [
+                { type: 'text', text: 'known' },
+                { type: 'future_part', value: 'unknown' },
+              ],
+              tool_calls: [
+                { id: 'call', type: 'function', function: { name: 'tool', arguments: '{}' } },
+              ],
+            },
+            finish_reason: 'tool_calls',
+          },
+        ],
+      },
+    },
+  );
+  expect(result.output[0]!.prefixKnown).toBe(false);
+  expect(result.output[1]!.kind).toBe('tool_call');
+  expect(result.evidence).toEqual([]);
+  expect(result.evidenceChain).toBeNull();
 });

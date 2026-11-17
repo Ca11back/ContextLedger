@@ -139,3 +139,71 @@ test('superseded attempts are dimmed with a retry note and retries are labelled'
   expect(retry).toContain('重试第 1 轮');
   expect(retry).not.toContain('superseded');
 });
+
+test('a message header whose content never arrived says so once the stream has ended', () => {
+  const header = { ...base, kind: 'assistant' as const, partCount: 1, parts: [] };
+  const ended = render(header);
+  expect(ended).toContain('这段内容没有返回，可查看原始数据');
+  expect(ended).not.toContain('正在载入…');
+  const client = createDashboardQueryClient();
+  try {
+    const pending = renderToStaticMarkup(
+      <QueryClientProvider client={client}>
+        <Message message={header} pending />
+      </QueryClientProvider>,
+    );
+    expect(pending).toContain('正在载入…');
+    expect(pending).not.toContain('这段内容没有返回');
+  } finally {
+    client.clear();
+  }
+});
+
+test('only the last message of an open stream is still loading', () => {
+  const summary: TurnSummary = {
+    turnIndex: 1,
+    recordId: 1,
+    requestId: 'req-1',
+    receivedAt: 0,
+    model: 'm',
+    inputTokens: null,
+    outputTokens: null,
+    charge: null,
+    durationMs: null,
+    completeness: 'complete',
+    linkRule: null,
+    parentOutputIncomplete: false,
+    contextReset: null,
+    media: false,
+  };
+  const messages: MessageView[] = [
+    { ...base, messageId: 'a', kind: 'user', parts: [] },
+    { ...base, messageId: 'b', kind: 'assistant', side: 'output', parts: [] },
+  ];
+  const renderTurn = (streamOpen: boolean) => {
+    const client = createDashboardQueryClient();
+    try {
+      return renderToStaticMarkup(
+        <QueryClientProvider client={client}>
+          <TurnBlock
+            view={{ turn: summary, reset: null, messages }}
+            anchored={false}
+            openRaw={() => {}}
+            spurs={[]}
+            go={() => {}}
+            search={{}}
+            streamOpen={streamOpen}
+          />
+        </QueryClientProvider>,
+      );
+    } finally {
+      client.clear();
+    }
+  };
+  const open = renderTurn(true);
+  expect(open.split('这段内容没有返回').length - 1).toBe(1);
+  expect(open.split('正在载入…').length - 1).toBe(1);
+  const ended = renderTurn(false);
+  expect(ended.split('这段内容没有返回').length - 1).toBe(2);
+  expect(ended).not.toContain('正在载入…');
+});

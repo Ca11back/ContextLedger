@@ -90,7 +90,7 @@ function envelope(input: unknown[], answer = 'answer', o: Options = {}): Envelop
               events: [
                 {
                   event: 'response.output_item.done',
-                  data: { type: 'response.output_item.done', item: output[0] },
+                  data: { type: 'response.output_item.done', output_index: 0, item: output[0] },
                 },
               ],
             }
@@ -125,6 +125,8 @@ interface Row {
   parent_coverage: number;
   evidence_chain: string | null;
   input_chain: string | null;
+  announcements_valid: number;
+  announced_output: string;
   completeness: string;
   retry_of: number | null;
   retry_of_turn: number | null;
@@ -348,7 +350,7 @@ test('retention preserves primary tombstone numbering, declared origins and incr
 });
 function downgrade(s: Ledger) {
   s.db.exec(
-    'DROP TABLE conversation_models; DROP TABLE threads; DROP TABLE conversations; DROP INDEX requests_evidence; DROP INDEX requests_response; DROP INDEX requests_thread; DROP INDEX requests_session; DROP INDEX requests_parent_thread; DROP INDEX requests_conversation; DROP INDEX requests_parent; DROP INDEX requests_conversation_time; DROP INDEX requests_retry; DROP INDEX requests_parent_eligible;',
+    'DROP TABLE conversation_models; DROP TABLE threads; DROP TABLE conversations; DROP INDEX requests_evidence; DROP INDEX requests_response; DROP INDEX requests_thread; DROP INDEX requests_session; DROP INDEX requests_parent_thread; DROP INDEX requests_conversation; DROP INDEX requests_parent; DROP INDEX requests_conversation_time; DROP INDEX requests_retry; DROP INDEX requests_parent_eligible; DROP INDEX requests_partial_input;',
   );
   for (const col of Object.keys(requestIndexColumns))
     s.db.exec(`ALTER TABLE requests DROP COLUMN ${col}`);
@@ -367,7 +369,7 @@ test('v2 restart backfill verifies evidence, preserves bytes and refs, and publi
   expect(row(restarted, b.id).parent_id).toBe(a.id);
   expect(restarted.restore(a.id)).toEqual(bytes);
   expect(restarted.integrity().mismatches).toBe(0);
-  expect(restarted.db.query('PRAGMA user_version').get()).toEqual({ user_version: 4 });
+  expect(restarted.db.query('PRAGMA user_version').get()).toEqual({ user_version: 5 });
   downgrade(restarted);
   restarted.db.query('UPDATE requests SET body_hash=? WHERE id=?').run('0'.repeat(64), a.id);
   restarted.close();
@@ -550,78 +552,86 @@ const schema4Only = [
   'continuation_eligible',
   'last_user_text',
 ];
+function downgradeV4(s: Ledger) {
+  s.db.exec(
+    'DROP INDEX requests_partial_input; ALTER TABLE requests DROP COLUMN announced_output; ALTER TABLE requests DROP COLUMN announcements_valid; PRAGMA user_version=4;',
+  );
+}
 function downgradeV3(s: Ledger) {
+  downgradeV4(s);
   s.db.exec('DROP INDEX requests_retry; DROP INDEX requests_parent_eligible;');
   for (const column of schema4Only) s.db.exec(`ALTER TABLE requests DROP COLUMN ${column}`);
   s.db.exec('PRAGMA user_version=3');
 }
-test('v3 rebuild and explicit rebuild preserve immutable roots, CAS, usage, charges, uploads and pins', async () => {
-  const c = config(),
-    s = store(c);
-  const input = [user(`large root ${'x'.repeat(2500)}`)];
-  const p = await put(s, input, 'P', { thread: 'main' });
-  const retryInput = [...input, assistant('P'), user('next')];
-  const failed = await put(s, retryInput, '', { thread: 'main', error: true });
-  const success = await put(s, retryInput, 'OK', { thread: 'main' });
-  const objects = s.db.query('SELECT * FROM objects ORDER BY hash').all();
-  expect(objects.length).toBeGreaterThan(0);
-  const firstObject = s.db
-    .query<{ hash: string; length: number }, []>('SELECT hash,length FROM objects LIMIT 1')
-    .get()!;
-  s.db
-    .query(
-      'INSERT INTO uploads(upload_id,source,manifest_hash,manifest,envelope_hash,envelope_bytes,state,created_at,expires_at,updated_at,hint) VALUES(?,?,?,?,?,?,?,?,?,?,?)',
-    )
-    .run(
-      'pending-synthetic',
-      'synthetic',
-      'm',
-      '{}',
-      'e',
-      firstObject.length,
-      'partial',
-      1,
-      Date.now() + 60_000,
-      1,
-      '{}',
-    );
-  s.db
-    .query('INSERT INTO pending_pins(upload_id,hash,length,idx,priority) VALUES(?,?,?,?,?)')
-    .run('pending-synthetic', firstObject.hash, firstObject.length, 0, 0);
-  const immutableSQL =
-    'SELECT id,received_at,source,upload_id,host_request_id,model,channel,user_label,token_label,outcome,truncated,media,duration_ms,usage_json,cost_json,body_hash,body_length,wire_manifest_hash,storage_mode,payload FROM requests ORDER BY id';
-  const original = s.db.query(immutableSQL).all(),
-    uploads = s.db.query('SELECT * FROM uploads').all(),
-    pins = s.db.query('SELECT * FROM pending_pins').all();
-  const expectedBytes = s.restore(p.id);
-  downgradeV3(s);
-  s.db
-    .query('UPDATE requests SET conversation_id=999,turn_index=99,parent_id=NULL WHERE id=?')
-    .run(success.id);
-  s.close();
-  stores.splice(stores.indexOf(s), 1);
-  const reopened = store(c);
-  expect(reopened.db.query('PRAGMA user_version').get()).toEqual({ user_version: 4 });
-  expect(row(reopened, success.id).conversation_id).toBe(row(reopened, p.id).conversation_id);
-  expect(row(reopened, success.id).retry_of).toBe(failed.id);
-  expect(reopened.db.query(immutableSQL).all()).toEqual(original);
-  expect(reopened.db.query('SELECT * FROM objects ORDER BY hash').all()).toEqual(objects);
-  expect(reopened.db.query('SELECT * FROM uploads').all()).toEqual(uploads);
-  expect(reopened.db.query('SELECT * FROM pending_pins').all()).toEqual(pins);
-  expect(reopened.restore(p.id)).toEqual(expectedBytes);
-  reopened.rebuildConversations();
-  expect(reopened.db.query(immutableSQL).all()).toEqual(original);
-  expect(reopened.integrity().mismatches).toBe(0);
-});
-test('backfill command backs up schema3 before opening and explicitly rebuilds schema4', async () => {
+for (const oldVersion of [3, 4] as const)
+  test(`v${oldVersion} rebuild and explicit rebuild preserve immutable roots, CAS, usage, charges, uploads and pins`, async () => {
+    const c = config(),
+      s = store(c);
+    const input = [user(`large root ${'x'.repeat(2500)}`)];
+    const p = await put(s, input, 'P', { thread: 'main' });
+    const retryInput = [...input, assistant('P'), user('next')];
+    const failed = await put(s, retryInput, '', { thread: 'main', error: true });
+    const success = await put(s, retryInput, 'OK', { thread: 'main' });
+    const objects = s.db.query('SELECT * FROM objects ORDER BY hash').all();
+    expect(objects.length).toBeGreaterThan(0);
+    const firstObject = s.db
+      .query<{ hash: string; length: number }, []>('SELECT hash,length FROM objects LIMIT 1')
+      .get()!;
+    s.db
+      .query(
+        'INSERT INTO uploads(upload_id,source,manifest_hash,manifest,envelope_hash,envelope_bytes,state,created_at,expires_at,updated_at,hint) VALUES(?,?,?,?,?,?,?,?,?,?,?)',
+      )
+      .run(
+        'pending-synthetic',
+        'synthetic',
+        'm',
+        '{}',
+        'e',
+        firstObject.length,
+        'partial',
+        1,
+        Date.now() + 60_000,
+        1,
+        '{}',
+      );
+    s.db
+      .query('INSERT INTO pending_pins(upload_id,hash,length,idx,priority) VALUES(?,?,?,?,?)')
+      .run('pending-synthetic', firstObject.hash, firstObject.length, 0, 0);
+    const immutableSQL =
+      'SELECT id,received_at,source,upload_id,host_request_id,model,channel,user_label,token_label,outcome,truncated,media,duration_ms,usage_json,cost_json,body_hash,body_length,wire_manifest_hash,storage_mode,payload FROM requests ORDER BY id';
+    const original = s.db.query(immutableSQL).all(),
+      uploads = s.db.query('SELECT * FROM uploads').all(),
+      pins = s.db.query('SELECT * FROM pending_pins').all();
+    const expectedBytes = s.restore(p.id);
+    if (oldVersion === 3) downgradeV3(s);
+    else downgradeV4(s);
+    s.db
+      .query('UPDATE requests SET conversation_id=999,turn_index=99,parent_id=NULL WHERE id=?')
+      .run(success.id);
+    s.close();
+    stores.splice(stores.indexOf(s), 1);
+    const reopened = store(c);
+    expect(reopened.db.query('PRAGMA user_version').get()).toEqual({ user_version: 5 });
+    expect(row(reopened, success.id).conversation_id).toBe(row(reopened, p.id).conversation_id);
+    expect(row(reopened, success.id).retry_of).toBe(failed.id);
+    expect(reopened.db.query(immutableSQL).all()).toEqual(original);
+    expect(reopened.db.query('SELECT * FROM objects ORDER BY hash').all()).toEqual(objects);
+    expect(reopened.db.query('SELECT * FROM uploads').all()).toEqual(uploads);
+    expect(reopened.db.query('SELECT * FROM pending_pins').all()).toEqual(pins);
+    expect(reopened.restore(p.id)).toEqual(expectedBytes);
+    reopened.rebuildConversations();
+    expect(reopened.db.query(immutableSQL).all()).toEqual(original);
+    expect(reopened.integrity().mismatches).toBe(0);
+  });
+test('backfill command backs up schema4 before opening and explicitly rebuilds schema5', async () => {
   const c = config(),
     s = store(c);
   const record = await put(s, [user('backup me')], 'OK', { thread: 'main' });
   const bytes = s.restore(record.id);
-  downgradeV3(s);
+  downgradeV4(s);
   s.close();
   stores.splice(stores.indexOf(s), 1);
-  const destination = join(c.database, '..', 'before-v4.sqlite');
+  const destination = join(c.database, '..', 'before-v5.sqlite');
   const env = {
     ...process.env,
     LEDGER_DATABASE: c.database,
@@ -639,7 +649,7 @@ test('backfill command backs up schema3 before opening and explicitly rebuilds s
   expect(refused.status).not.toBe(0);
   expect(refused.stderr).toContain('Backup destination exists');
   const unchanged = new Database(c.database, { readonly: true });
-  expect(unchanged.query('PRAGMA user_version').get()).toEqual({ user_version: 3 });
+  expect(unchanged.query('PRAGMA user_version').get()).toEqual({ user_version: 4 });
   expect(unchanged.query('SELECT body_hash FROM requests WHERE id=?').get(record.id)).toEqual({
     body_hash: hash(bytes),
   });
@@ -650,16 +660,16 @@ test('backfill command backs up schema3 before opening and explicitly rebuilds s
     { cwd: process.cwd(), env, encoding: 'utf8' },
   );
   expect(result.status).toBe(0);
-  expect(JSON.parse(result.stdout).schema).toBe(4);
+  expect(JSON.parse(result.stdout).schema).toBe(5);
   const before = new Database(destination, { readonly: true });
-  expect(before.query('PRAGMA user_version').get()).toEqual({ user_version: 3 });
+  expect(before.query('PRAGMA user_version').get()).toEqual({ user_version: 4 });
   expect(before.query('SELECT body_hash FROM requests WHERE id=?').get(record.id)).toEqual({
     body_hash: hash(bytes),
   });
   before.close();
   const reopened = store(c);
   expect(reopened.restore(record.id)).toEqual(bytes);
-  expect(reopened.db.query('PRAGMA user_version').get()).toEqual({ user_version: 4 });
+  expect(reopened.db.query('PRAGMA user_version').get()).toEqual({ user_version: 5 });
 });
 
 test('incremental previous-response input titles use the first new real user text', async () => {
@@ -730,4 +740,351 @@ test('previous-response slot occupancy uses recovered completed output without b
   expect(continuation.conversation_id).toBe(other.conversation_id);
   expect(continuation.retry_of).toBeNull();
   expect(conv(s, other.conversation_id).branch_count).toBe(0);
+});
+
+const reasoningItem = (id: string) => ({ type: 'reasoning', id, status: 'completed', summary: [] });
+const callItem = (id: string, args = '{}') => ({
+  type: 'function_call',
+  id,
+  call_id: `call-${id}`,
+  name: 'tool',
+  arguments: args,
+  status: 'completed',
+});
+const toolResult = (id: string) => ({
+  type: 'function_call_output',
+  call_id: `call-${id}`,
+  output: 'result',
+});
+const itemAdded = (index: number, item: unknown) => ({
+  event: 'response.output_item.added',
+  data: { type: 'response.output_item.added', output_index: index, item },
+});
+const itemDone = (index: number, item: unknown) => ({
+  event: 'response.output_item.done',
+  data: { type: 'response.output_item.done', output_index: index, item },
+});
+async function streamPut(
+  s: Ledger,
+  input: unknown[],
+  events: unknown[],
+  o: Options = { thread: 'main', session: 'session' },
+) {
+  const value = envelope(input, '', o);
+  value.report.response = { status: o.error ? 502 : 200, truncated: true, events };
+  const bytes = Buffer.from(JSON.stringify(value)),
+    result = await s.ingest(bytes);
+  expect(hash(s.restore(result.id))).toBe(hash(bytes));
+  return row(s, result.id);
+}
+function announcedEvents(reasonId: string, callId: string, completed = false) {
+  const reason = reasoningItem(reasonId),
+    call = callItem(callId);
+  return [
+    itemAdded(0, reason),
+    itemDone(0, reason),
+    itemAdded(1, call),
+    ...(completed ? [itemDone(1, call)] : []),
+  ];
+}
+test('41–44 partial tool-loop shape links ordered reasoning, completed calls and announced calls in one conversation', async () => {
+  const s = store(),
+    base = [user('do work')];
+  const first = await streamPut(s, base, announcedEvents('reason41', 'tool41', true));
+  const input42 = [...base, reasoningItem('reason41'), callItem('tool41'), toolResult('tool41')];
+  const second = await streamPut(s, input42, announcedEvents('reason42', 'tool42'));
+  const input43 = [
+    ...input42,
+    reasoningItem('reason42'),
+    callItem('tool42', '{"received":"full arguments"}'),
+    toolResult('tool42'),
+  ];
+  const third = await streamPut(s, input43, announcedEvents('reason43', 'tool43'));
+  const last = await put(
+    s,
+    [
+      ...input43,
+      reasoningItem('reason43'),
+      callItem('tool43'),
+      toolResult('tool43'),
+      user('optional new suffix'),
+    ],
+    'done',
+    { thread: 'main', session: 'session' },
+  );
+  expect(second.parent_id).toBe(first.id);
+  expect(second.link_rule).toBe('prefix_partial');
+  expect(third.parent_id).toBe(second.id);
+  expect(third.parent_coverage).toBe(input42.length);
+  expect(third.link_rule).toBe('prefix_partial');
+  expect(last.parent_id).toBe(third.id);
+  expect(last.parent_coverage).toBe(input43.length);
+  expect(last.link_rule).toBe('prefix_partial');
+  for (const r of [first, second, third, last])
+    expect(r.conversation_id).toBe(first.conversation_id);
+  expect(last.turn_index).toBe(4);
+  expect(conv(s, first.conversation_id).branch_count).toBe(0);
+  const stored = JSON.parse(second.announced_output);
+  expect(stored).toHaveLength(2);
+  expect(stored[0].completedHash).toMatch(/^[a-f0-9]{64}$/);
+  expect(stored[1].idHash).toMatch(/^[a-f0-9]{64}$/);
+  expect(second.announced_output.includes('reason42')).toBe(false);
+  expect(second.announced_output.includes('tool42')).toBe(false);
+  expect(s.integrity().mismatches).toBe(0);
+});
+test('announced continuation rejects id/type/order/completed-payload mismatch and malformed announcement lists', async () => {
+  for (const variant of [
+    'id',
+    'type',
+    'order',
+    'completed',
+    'completed-id',
+    'gap',
+    'missing',
+    'duplicate',
+    'overflow',
+    'oversized',
+  ] as const) {
+    const s = store(),
+      base = [user(`base-${variant}`)],
+      reason = reasoningItem('r'),
+      call = callItem('c');
+    let events = announcedEvents('r', 'c');
+    if (variant === 'gap') events = [itemAdded(1, call)];
+    if (variant === 'missing')
+      events = [itemAdded(0, { type: 'function_call', name: 'tool', arguments: '' })];
+    if (variant === 'duplicate') events = [itemAdded(0, call), itemAdded(1, call)];
+    if (variant === 'overflow')
+      events = Array.from({ length: 257 }, (_, i) => itemAdded(i, callItem(`c${i}`)));
+    if (variant === 'oversized') events = [itemAdded(0, { ...call, id: 'x'.repeat(513) })];
+    const parent = await streamPut(s, base, events);
+    const echo: unknown[] = [reason, call];
+    if (variant === 'id') echo[1] = callItem('different');
+    if (variant === 'type') echo[1] = { type: 'reasoning', id: 'c', summary: [] };
+    if (variant === 'order') echo.reverse();
+    if (variant === 'completed-id') echo[0] = reasoningItem('different-reason');
+    if (variant === 'completed')
+      echo[0] = { ...reason, summary: [{ type: 'summary_text', text: 'changed' }] };
+    const child = await put(s, [...base, ...echo, toolResult('c')], 'done', {
+      thread: 'main',
+      session: 'session',
+    });
+    expect(child.parent_id).toBeNull();
+    if (['gap', 'missing', 'duplicate', 'overflow', 'oversized'].includes(variant)) {
+      expect(parent.announcements_valid).toBe(0);
+      expect(parent.announced_output).toBe('[]');
+    }
+  }
+});
+test('announced continuation requires exact input/domain/thread, excludes errors and undeclared requests', async () => {
+  for (const variant of [
+    'input',
+    'thread',
+    'token',
+    'user',
+    'protocol',
+    'error',
+    'undeclared',
+    'previous',
+  ] as const) {
+    const s = store(),
+      base = [user('base')];
+    const options: Options = {
+      thread: 'main',
+      session: 'session',
+      ...(variant === 'error' ? { error: true } : {}),
+      ...(variant === 'undeclared' ? { thread: undefined } : {}),
+      ...(variant === 'previous' ? { previous: 'unknown' } : {}),
+    };
+    const parent = await streamPut(s, base, announcedEvents('r', 'c'), options);
+    const childOptions: Options = {
+      thread: 'main',
+      session: 'session',
+      ...(variant === 'thread' ? { thread: 'other' } : {}),
+      ...(variant === 'token' ? { tokenId: 2 } : {}),
+      ...(variant === 'user' ? { userId: 2 } : {}),
+      ...(variant === 'protocol' ? { format: 'openai' } : {}),
+      ...(variant === 'undeclared' ? { thread: undefined } : {}),
+    };
+    const child = await put(
+      s,
+      [
+        ...(variant === 'input' ? [user('changed')] : base),
+        reasoningItem('r'),
+        callItem('c'),
+        toolResult('c'),
+      ],
+      'done',
+      childOptions,
+    );
+    expect(child.parent_id).toBeNull();
+    if (['error', 'undeclared', 'previous'].includes(variant))
+      expect(parent.announcements_valid).toBe(0);
+  }
+});
+test('announced candidates compete with prefix coverage, ties fail closed and dual-path same-parent is counted once', async () => {
+  const s = store(),
+    base = [user('base')];
+  const both = await streamPut(s, base, announcedEvents('r', 'c', true));
+  const child = await put(
+    s,
+    [...base, reasoningItem('r'), callItem('c'), toolResult('c')],
+    'done',
+    { thread: 'main', session: 'session' },
+  );
+  expect(child.parent_id).toBe(both.id);
+  expect(child.context_reset).toBeNull();
+  const a = await streamPut(s, [user('tie')], announcedEvents('r2', 'c2'));
+  await streamPut(s, [user('tie')], announcedEvents('r2', 'c2'));
+  const ambiguous = await put(
+    s,
+    [user('tie'), reasoningItem('r2'), callItem('c2'), toolResult('c2')],
+    'done',
+    { thread: 'main', session: 'session' },
+  );
+  expect(ambiguous.parent_id).toBeNull();
+  expect(ambiguous.context_reset).toBe('no_prefix');
+  expect(a.id).toBeGreaterThan(both.id);
+  // A longer announced-item coverage beats a shorter complete-prefix candidate.
+  const shared = [user('rank')];
+  const shorter = await put(s, shared, 'answer', { thread: 'main', session: 'session' });
+  const longBase = [...shared, assistant('answer'), user('new')];
+  const longer = await streamPut(s, longBase, announcedEvents('r3', 'c3'));
+  const winner = await put(
+    s,
+    [...longBase, reasoningItem('r3'), callItem('c3'), toolResult('c3')],
+    'done',
+    { thread: 'main', session: 'session' },
+  );
+  expect(winner.parent_id).toBe(longer.id);
+  expect(winner.parent_id).not.toBe(shorter.id);
+});
+
+test('announced metadata mutation after prepare rejects the parent in the final transaction', async () => {
+  const s = store(),
+    base = [user('base')];
+  const parent = await streamPut(s, base, announcedEvents('r', 'c'));
+  const original = s.conversations.prepare.bind(s.conversations);
+  s.conversations.prepare = (normalized, meta) => {
+    expect(s.db.inTransaction).toBe(false);
+    const prepared = original(normalized, meta);
+    expect(prepared.parent?.id).toBe(parent.id);
+    s.db
+      .query("UPDATE requests SET announced_output='[]',announcements_valid=0 WHERE id=?")
+      .run(parent.id);
+    return prepared;
+  };
+  const child = await put(
+    s,
+    [...base, reasoningItem('r'), callItem('c'), toolResult('c')],
+    'done',
+    { thread: 'main', session: 'session' },
+  );
+  expect(child.parent_id).toBeNull();
+  expect(child.parent_coverage).toBe(0);
+  expect(child.context_reset).toBe('no_prefix');
+  expect(s.integrity().mismatches).toBe(0);
+});
+test('announcement projections stay bounded and count toward storage accounting with indexed candidate lookup', async () => {
+  const s = store(),
+    base = [user('metadata')];
+  const before = s.metrics().logical;
+  const events = Array.from({ length: 256 }, (_, i) => itemAdded(i, callItem(`item-${i}`)));
+  const parent = await streamPut(s, base, events);
+  expect(parent.announcements_valid).toBe(1);
+  const json = JSON.parse(parent.announced_output);
+  expect(json).toHaveLength(256);
+  expect(Buffer.byteLength(parent.announced_output)).toBeLessThanOrEqual(65_536);
+  expect(s.metrics().logical - before).toBeGreaterThanOrEqual(
+    Buffer.byteLength(parent.announced_output),
+  );
+  const planQuery = s.db.query<
+    { detail: string },
+    [string, string, string, string, string, string]
+  >(
+    "EXPLAIN QUERY PLAN SELECT id FROM requests WHERE source=? AND user_id=? AND token_id=? AND protocol=? AND thread_key=? AND completeness='partial' AND announcements_valid=1 AND input_chain IN (?)",
+  );
+  const plan = planQuery.all(
+    'synthetic',
+    '1',
+    '1',
+    'openai_responses',
+    parent.thread_key!,
+    parent.input_chain!,
+  );
+  planQuery.finalize();
+  expect(plan.some((r) => r.detail.includes('requests_partial_input'))).toBe(true);
+  const echo = Array.from({ length: 256 }, (_, i) => callItem(`item-${i}`));
+  const child = await put(s, [...base, ...echo, user('suffix')], 'done', {
+    thread: 'main',
+    session: 'session',
+  });
+  expect(child.parent_id).toBe(parent.id);
+  expect(child.parent_coverage).toBe(base.length);
+});
+
+test('completed partial-body output cannot use announced ids to accept an edited payload', async () => {
+  const s = store(),
+    base = [user('partial-body')],
+    call = callItem('body-call', '{"exact":true}');
+  const value = envelope(base, '', { thread: 'main', session: 'session' });
+  value.report.response = {
+    status: 200,
+    truncated: true,
+    body: { status: 'incomplete', output: [call] },
+    events: [itemAdded(0, { ...call, status: 'in_progress', arguments: '' })],
+  };
+  const bytes = Buffer.from(JSON.stringify(value));
+  const inserted = await s.ingest(bytes),
+    parent = row(s, inserted.id);
+  expect(JSON.parse(parent.announced_output)[0].completedHash).toHaveLength(64);
+  const edited = await put(
+    s,
+    [...base, callItem('body-call', '{"exact":false}'), toolResult('body-call')],
+    'done',
+    { thread: 'main', session: 'session' },
+  );
+  expect(edited.parent_id).toBeNull();
+  const exact = await put(s, [...base, call, toolResult('body-call')], 'done', {
+    thread: 'main',
+    session: 'session',
+  });
+  expect(exact.parent_id).toBe(parent.id);
+  expect(s.restore(parent.id)).toEqual(bytes);
+});
+test('v4 corrupt evidence never partially publishes schema5 metadata', async () => {
+  const c = config(),
+    s = store(c);
+  const p = await streamPut(s, [user('base')], announcedEvents('r', 'c'));
+  downgradeV4(s);
+  s.db.query('UPDATE requests SET body_hash=? WHERE id=?').run('0'.repeat(64), p.id);
+  const original = s.db.query('SELECT id,conversation_id,turn_index FROM requests').all();
+  s.close();
+  stores.splice(stores.indexOf(s), 1);
+  expect(() => new Ledger(c)).toThrow();
+  const db = new Database(c.database);
+  expect(db.query('PRAGMA user_version').get()).toEqual({ user_version: 4 });
+  expect(db.query('SELECT id,conversation_id,turn_index FROM requests').all()).toEqual(original);
+  expect(
+    (db.query('PRAGMA table_info(requests)').all() as { name: string }[]).some(
+      (c) => c.name === 'announced_output',
+    ),
+  ).toBe(false);
+  db.close();
+});
+
+test('announced continuation preserves empty and system-only input parent exclusion', async () => {
+  for (const base of [[], [{ role: 'system', content: 'system-only' }]]) {
+    const s = store(),
+      parent = await streamPut(s, base, announcedEvents('r', 'c'));
+    const child = await put(
+      s,
+      [...base, reasoningItem('r'), callItem('c'), toolResult('c')],
+      'done',
+      { thread: 'main', session: 'session' },
+    );
+    expect(parent.announcements_valid).toBe(0);
+    expect(parent.evidence_chain).toBeNull();
+    expect(child.parent_id).toBeNull();
+  }
 });

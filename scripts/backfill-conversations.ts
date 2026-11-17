@@ -4,13 +4,13 @@ import { loadConfig } from '../src/server/config';
 import { Ledger } from '../src/server/storage';
 
 // Before an approved deployment, stop the collector and run this command with
-// --backup <new-path>. The backup is taken BEFORE Ledger opens/migrates schema2/3.
-// --rebuild explicitly recomputes an existing schema4 index; conversation/turn ids
+// --backup <new-path>. The backup is taken BEFORE Ledger opens/migrates schema2/3/4.
+// --rebuild explicitly recomputes an existing schema5 index; conversation/turn ids
 // may change. Original request ids, exact evidence, charges and CAS stay intact.
 const args = process.argv.slice(2);
 if (args.includes('--help')) {
   console.log(
-    'bun run scripts/backfill-conversations.ts [--backup <new-path>] [--rebuild]\nStop the collector and back up before deployment. Opening schema2/3 migrates to schema4; --rebuild also recomputes schema4 membership. Derived conversation/turn ids may change.',
+    'bun run scripts/backfill-conversations.ts [--backup <new-path>] [--rebuild]\nStop the collector and back up before deployment. Opening schema2/3/4 migrates to schema5; --rebuild also recomputes schema5 membership. Derived conversation/turn ids may change.',
   );
 } else {
   if (
@@ -38,7 +38,7 @@ if (args.includes('--help')) {
     if (args.includes('--rebuild')) ledger.rebuildConversations();
     console.log(
       JSON.stringify({
-        schema: 4,
+        schema: 5,
         records: ledger.metrics().records,
         conversations: ledger.db.query('SELECT count(*) AS count FROM conversations').get(),
       }),

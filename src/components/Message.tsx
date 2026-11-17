@@ -135,7 +135,12 @@ function mediaLabel(label: string) {
   return mediaNames[label] ?? label;
 }
 
-export function Message({ message }: { message: MessageView }) {
+/**
+ * `pending`: the stream may still deliver this message's first chunks (it is the last
+ * message received and more pages exist). Otherwise a header without parts means the
+ * content never arrived.
+ */
+export function Message({ message, pending = false }: { message: MessageView; pending?: boolean }) {
   const label =
     message.kind === 'tool_call' || message.kind === 'tool_result'
       ? `${kindLabel[message.kind]}${message.name ? ` · ${message.name}` : ''}`
@@ -155,7 +160,7 @@ export function Message({ message }: { message: MessageView }) {
         <Part key={part.partIndex} message={message} part={part} />
       ))}
       {message.parts.length === 0 && !message.media && message.partCount > 0 && (
-        <p className="muted small">正在载入…</p>
+        <p className="muted small">{pending ? '正在载入…' : '这段内容没有返回，可查看原始数据'}</p>
       )}
       {message.alternatives ? (
         <p className="muted small">另有 {message.alternatives} 个候选回复，可在原始数据中查看。</p>
@@ -164,7 +169,15 @@ export function Message({ message }: { message: MessageView }) {
   );
 }
 
-export function LeadingHistory({ messages, label }: { messages: MessageView[]; label: string }) {
+export function LeadingHistory({
+  messages,
+  label,
+  pendingId,
+}: {
+  messages: MessageView[];
+  label: string;
+  pendingId?: string;
+}) {
   const [open, setOpen] = useState(false);
   return (
     <div className="carried">
@@ -176,7 +189,14 @@ export function LeadingHistory({ messages, label }: { messages: MessageView[]; l
           {open ? '收起' : '展开'}
         </button>
       </div>
-      {open && messages.map((message) => <Message key={message.messageId} message={message} />)}
+      {open &&
+        messages.map((message) => (
+          <Message
+            key={message.messageId}
+            message={message}
+            pending={message.messageId === pendingId}
+          />
+        ))}
     </div>
   );
 }

@@ -1,6 +1,6 @@
 import { object } from '../../contracts';
 import { hash } from '../codec';
-import type { MessageKind, NormalizedMessage, NormalizedPart } from './types';
+import type { AnnouncedOutputItem, MessageKind, NormalizedMessage, NormalizedPart } from './types';
 
 export const array = (value: unknown): unknown[] => (Array.isArray(value) ? value : []);
 export const string = (value: unknown): string => (typeof value === 'string' ? value : '');
@@ -83,6 +83,8 @@ export interface AdapterResult {
   invalid?: boolean;
   responseId?: string;
   stopReason?: string;
+  announcedOutput?: AnnouncedOutputItem[];
+  announcementsValid?: boolean;
 }
 export interface CapturedEvent {
   type: string;

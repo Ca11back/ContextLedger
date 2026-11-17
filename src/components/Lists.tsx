@@ -1,8 +1,9 @@
 import { useInfiniteQuery } from '@tanstack/react-query';
-import { useEffect, useRef } from 'react';
+import { useCallback, useEffect } from 'react';
 import { count, shortId, when } from '../client/format';
 import { conversationsQuery, requestsQuery } from '../client/queries';
 import { type AppSearch, hasFilters } from '../client/search';
+import { useSentinel } from '../client/sentinel';
 import { EmptyState, ErrorState, Loading } from './Feedback';
 
 type Navigate = (next: AppSearch) => void;
@@ -83,19 +84,31 @@ function FilterBar({
   );
 }
 
-/** Loads the next page when the sentinel scrolls into view. */
-function useAutoLoad(enabled: boolean, load: () => void) {
-  const sentinel = useRef<HTMLDivElement>(null);
-  useEffect(() => {
-    const node = sentinel.current;
-    if (!node || !enabled) return;
-    const observer = new IntersectionObserver((entries) => {
-      if (entries.some((entry) => entry.isIntersecting)) load();
-    });
-    observer.observe(node);
-    return () => observer.disconnect();
-  }, [enabled, load]);
-  return sentinel;
+/** Loads the next page when the callback-ref sentinel is on screen (see useSentinel). */
+function useAutoLoad(query: {
+  hasNextPage: boolean;
+  isFetching: boolean;
+  isFetchNextPageError: boolean;
+  fetchNextPage: () => Promise<unknown>;
+}) {
+  const { fetchNextPage } = query;
+  const load = useCallback(() => void fetchNextPage(), [fetchNextPage]);
+  const sentinel = useSentinel({
+    hasNextPage: query.hasNextPage,
+    isFetching: query.isFetching,
+    failed: query.isFetchNextPageError,
+    load,
+  });
+  return { ...sentinel, load };
+}
+
+function ManualLoad({ sentinel }: { sentinel: ReturnType<typeof useAutoLoad> }) {
+  if (!sentinel.showManual) return null;
+  return (
+    <button type="button" className="link small load-more" onClick={sentinel.load}>
+      继续载入
+    </button>
+  );
 }
 
 /** j / k move through rows outside text inputs. */
@@ -126,9 +139,7 @@ export function ConversationList({ search, go }: { search: AppSearch; go: Naviga
   const query = useInfiniteQuery(conversationsQuery(search));
   const rows = query.data?.pages.flatMap((page) => page.rows) ?? [];
   const open = (id: number) => go({ ...search, c: id, t: undefined, r: undefined });
-  const sentinel = useAutoLoad(query.hasNextPage && !query.isFetchingNextPage, () => {
-    void query.fetchNextPage();
-  });
+  const sentinel = useAutoLoad(query);
   useRowKeys(
     rows.map((row) => row.id),
     search.c,
@@ -139,7 +150,7 @@ export function ConversationList({ search, go }: { search: AppSearch; go: Naviga
       <FilterBar search={search} go={go} conversations />
       {query.isPending ? (
         <Loading label="正在读取会话…" />
-      ) : query.isError ? (
+      ) : query.isError && !query.data ? (
         <ErrorState error={query.error} retry={() => void query.refetch()} />
       ) : rows.length === 0 ? (
         hasFilters(search) ? (
@@ -188,8 +199,9 @@ export function ConversationList({ search, go }: { search: AppSearch; go: Naviga
           ))}
         </ul>
       )}
-      <div ref={sentinel} className="sentinel">
+      <div ref={sentinel.ref} className="sentinel">
         {query.isFetchingNextPage && <Loading label="正在读取更早的会话…" />}
+        <ManualLoad sentinel={sentinel} />
       </div>
     </nav>
   );
@@ -207,9 +219,7 @@ export function RequestList({ search, go }: { search: AppSearch; go: Navigate })
       go({ ...search, c: row.conversationId, t: row.turnIndex ?? undefined, r: recordId });
     else go({ ...search, c: undefined, t: undefined, r: recordId });
   };
-  const sentinel = useAutoLoad(query.hasNextPage && !query.isFetchingNextPage, () => {
-    void query.fetchNextPage();
-  });
+  const sentinel = useAutoLoad(query);
   useRowKeys(
     rows.map((row) => row.recordId),
     search.r,
@@ -220,7 +230,7 @@ export function RequestList({ search, go }: { search: AppSearch; go: Navigate })
       <FilterBar search={search} go={go} conversations={false} />
       {query.isPending ? (
         <Loading label="正在读取请求…" />
-      ) : query.isError ? (
+      ) : query.isError && !query.data ? (
         <ErrorState error={query.error} retry={() => void query.refetch()} />
       ) : rows.length === 0 ? (
         <EmptyState title={hasFilters(search) ? '没有符合条件的请求' : '还没有收到记录'}>
@@ -258,8 +268,9 @@ export function RequestList({ search, go }: { search: AppSearch; go: Navigate })
           ))}
         </ul>
       )}
-      <div ref={sentinel} className="sentinel">
+      <div ref={sentinel.ref} className="sentinel">
         {query.isFetchingNextPage && <Loading label="正在读取更早的请求…" />}
+        <ManualLoad sentinel={sentinel} />
       </div>
     </nav>
   );

@@ -2,6 +2,8 @@ import { afterEach, expect, test } from 'bun:test';
 import { existsSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { estimatePartial } from '../.trellis/tasks/11-17-conversation-backend/research/partial-estimate';
+import { partialLoopFixtures } from '../.trellis/tasks/11-17-conversation-backend/research/partial-fixtures';
 import { estimateRetry } from '../.trellis/tasks/11-17-conversation-backend/research/retry-estimate';
 import type { Envelope } from '../src/contracts';
 import type { Fragment, FragmentPage } from '../src/conversation-contracts';
@@ -745,4 +747,119 @@ test('read-only frozen shadow replay reduces synthetic historical branches and f
       throw new LedgerError(400, 'fixed_cutoff_required');
     }
   }, 400);
+});
+
+test('ordered partial prefix and announced item-id links retain echoed client output as incomplete-parent input', async () => {
+  const store = fixture();
+  const ids: Awaited<ReturnType<typeof insert>>[] = [];
+  for (const env of partialLoopFixtures()) ids.push(await insert(store, env));
+  expect(new Set(ids.map((row) => row.conversation)).size).toBe(1);
+  const rows = store.db
+    .query<
+      {
+        id: number;
+        parent_id: number | null;
+        parent_coverage: number;
+        input_count: number;
+        link_rule: string | null;
+      },
+      []
+    >('SELECT id,parent_id,parent_coverage,input_count,link_rule FROM requests ORDER BY id')
+    .all();
+  expect(rows.map((row) => row.parent_id)).toEqual([null, ids[0]!.id, ids[1]!.id, ids[2]!.id]);
+  expect(rows[1]!.parent_coverage).toBe(3);
+  expect(rows[2]!.parent_coverage).toBe(rows[1]!.input_count);
+  expect(rows[3]!.parent_coverage).toBe(rows[2]!.input_count);
+  const page = turns(store, ids[0]!.conversation, new URLSearchParams());
+  bounded(page);
+  expect(page.turns.map((turn) => turn.parentOutputIncomplete)).toEqual([false, true, true, true]);
+  const third = collect(store, ids[0]!.conversation, ids[2]!.turn).all;
+  const thirdInput = third.filter(
+    (fragment): fragment is Extract<Fragment, { type: 'message' }> =>
+      fragment.type === 'message' &&
+      fragment.turnIndex === ids[2]!.turn &&
+      fragment.side === 'input',
+  );
+  expect(thirdInput.map((fragment) => fragment.kind)).toEqual(['tool_call', 'tool_result']);
+  const thirdMessages = new Set(thirdInput.map((fragment) => fragment.messageId));
+  const thirdText = third.flatMap((fragment) =>
+    fragment.type === 'chunk' && thirdMessages.has(fragment.messageId) ? [fragment.text] : [],
+  );
+  expect(thirdText).toEqual(['{"step":2}', 'Synthetic tool result 42']);
+  remove(store, ids[1]!.id);
+  const after = collect(store, ids[0]!.conversation, ids[2]!.turn).all;
+  expect(
+    after.filter(
+      (fragment) =>
+        fragment.type === 'message' &&
+        fragment.turnIndex === ids[2]!.turn &&
+        fragment.side === 'input',
+    ).length,
+  ).toBe(2);
+});
+
+test('read-only schema4 partial forecast verifies evidence, metadata and source WAL while repairing the synthetic 41–44 split', async () => {
+  const store = fixture();
+  store.db.query('INSERT INTO sqlite_sequence(name,seq) VALUES(?,?)').run('requests', 40);
+  const ids: Awaited<ReturnType<typeof insert>>[] = [];
+  for (const env of partialLoopFixtures()) ids.push(await insert(store, env));
+  const columns = (
+    store.db.query('PRAGMA table_info(conversations)').all() as { name: string }[]
+  ).map((row) => row.name);
+  const root = ids[0]!.conversation;
+  const expressions = columns.map(
+    (column) =>
+      ({ id: '2', forked_from_conversation: String(root), forked_from_turn: '1' })[column] ??
+      column,
+  );
+  store.db.exec(
+    `INSERT INTO conversations(${columns.join(',')}) SELECT ${expressions.join(',')} FROM conversations WHERE id=${root}`,
+  );
+  store.db.exec(
+    'UPDATE requests SET conversation_id=2,turn_index=1,parent_id=41,parent_coverage=0 WHERE id=42; UPDATE requests SET conversation_id=1,turn_index=2,parent_id=NULL,parent_coverage=0 WHERE id=43; UPDATE requests SET conversation_id=1,turn_index=3,parent_id=NULL,parent_coverage=0 WHERE id=44; PRAGMA user_version=4',
+  );
+  const assignments = store.db
+    .query(
+      'SELECT id,conversation_id,turn_index,parent_id,parent_coverage FROM requests ORDER BY id',
+    )
+    .all();
+  const files = () =>
+    ['', '-wal'].map((suffix) =>
+      existsSync(store.config.database + suffix)
+        ? hash(readFileSync(store.config.database + suffix))
+        : null,
+    );
+  const before = files();
+  const result = estimatePartial(store.config.database, 372);
+  expect(result.before).toMatchObject({
+    requests: 4,
+    conversations: 2,
+    branches: 1,
+    emptyTitles: 0,
+    red: 0,
+    partial: 1,
+  });
+  expect(result.after).toMatchObject({
+    requests: 4,
+    conversations: 1,
+    branches: 0,
+    emptyTitles: 0,
+    red: 0,
+    partial: 0,
+  });
+  expect(result.selectedAfter.map((row) => row.id)).toEqual([41, 42, 43, 44]);
+  expect(result.selectedAfter.map((row) => row.parentId)).toEqual([null, 41, 42, 43]);
+  expect(result.selectedAfter.map((row) => row.parentCoverage)).toEqual([0, 3, 4, 6]);
+  expect(result.before.evidenceDigest).toBe(result.after.evidenceDigest);
+  expect(result.sourceMetadataDigest).toBe(result.verifiedSourceMetadataDigest);
+  expect(files()).toEqual(before);
+  expect(
+    store.db
+      .query(
+        'SELECT id,conversation_id,turn_index,parent_id,parent_coverage FROM requests ORDER BY id',
+      )
+      .all(),
+  ).toEqual(assignments);
+  expect(store.db.query('PRAGMA user_version').get()).toEqual({ user_version: 4 });
+  expect(JSON.stringify(result)).not.toContain('Synthetic ordered tool loop');
 });

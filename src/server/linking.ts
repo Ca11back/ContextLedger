@@ -2,7 +2,7 @@ import { Database, type SQLQueryBindings } from 'bun:sqlite';
 import type { Envelope } from '../contracts';
 import { object } from '../contracts';
 import { normalizeEnvelope } from './normalize';
-import type { NormalizedRequest } from './normalize/types';
+import type { AnnouncedOutputItem, NormalizedRequest } from './normalize/types';
 
 export const requestIndexColumns = {
   user_id: 'TEXT',
@@ -12,6 +12,8 @@ export const requestIndexColumns = {
   input_count: 'INTEGER NOT NULL DEFAULT 0',
   evidence_count: 'INTEGER NOT NULL DEFAULT 0',
   input_chain: 'TEXT',
+  announced_output: "TEXT NOT NULL DEFAULT '[]'",
+  announcements_valid: 'INTEGER NOT NULL DEFAULT 0',
   retry_input_chain: 'TEXT',
   previous_response_id: 'TEXT',
   retry_of: 'INTEGER',
@@ -62,6 +64,7 @@ CREATE INDEX IF NOT EXISTS threads_subagent ON threads(subagent_of,thread_key);
 CREATE TABLE IF NOT EXISTS conversation_models(conversation_id INTEGER NOT NULL, model TEXT NOT NULL, turns INTEGER NOT NULL,
  PRIMARY KEY(conversation_id,model));
 CREATE INDEX IF NOT EXISTS requests_evidence ON requests(source,user_id,token_id,protocol,evidence_chain);
+CREATE INDEX IF NOT EXISTS requests_partial_input ON requests(source,user_id,token_id,protocol,thread_key,input_chain) WHERE completeness='partial' AND announcements_valid=1;
 CREATE INDEX IF NOT EXISTS requests_response ON requests(source,user_id,token_id,protocol,response_id);
 CREATE INDEX IF NOT EXISTS requests_thread ON requests(thread_key);
 CREATE INDEX IF NOT EXISTS requests_session ON requests(session_key);
@@ -89,6 +92,10 @@ interface Parent {
   completeness: string;
   evidence_chain: string | null;
   evidence_count: number;
+  input_count: number;
+  input_chain: string | null;
+  announced_output: string;
+  announcements_valid: number;
   response_id: string | null;
   conversation_id: number;
   turn_index: number;
@@ -131,21 +138,80 @@ export interface PreparedIndex {
   parent: Parent | null;
   retry: Retry | null;
   continuationEligible: boolean;
+  parentCoverage: number;
+  announcedJson: string;
+  announcementsValid: boolean;
   title: string;
   inputTokens: number | null;
   outputTokens: number | null;
   charge: number | null;
 }
 const parentColumns =
-  'id,source,user_id,token_id,protocol,completeness,evidence_chain,evidence_count,response_id,conversation_id,turn_index,thread_key';
+  'id,source,user_id,token_id,protocol,completeness,evidence_chain,evidence_count,input_count,input_chain,announced_output,announcements_valid,response_id,conversation_id,turn_index,thread_key';
 const numeric = (v: unknown): number | null =>
   typeof v === 'number' && Number.isFinite(v) ? v : null;
+const announcementLimit = 65_536;
+function announcementsMatch(parent: Parent, child: NormalizedRequest): number | null {
+  if (
+    parent.completeness !== 'partial' ||
+    parent.announcements_valid !== 1 ||
+    !parent.input_chain ||
+    child.inputPrefixes[parent.input_count - 1] !== parent.input_chain ||
+    Buffer.byteLength(parent.announced_output) > announcementLimit
+  )
+    return null;
+  let announced: AnnouncedOutputItem[];
+  try {
+    const parsed: unknown = JSON.parse(parent.announced_output);
+    if (!Array.isArray(parsed) || parsed.length === 0 || parsed.length > 256) return null;
+    announced = parsed as AnnouncedOutputItem[];
+    const ids = new Set<string>();
+    for (let i = 0; i < announced.length; i++) {
+      const a = announced[i];
+      if (
+        !a ||
+        a.index !== i ||
+        typeof a.type !== 'string' ||
+        !a.type ||
+        typeof a.idHash !== 'string' ||
+        !/^[a-f0-9]{64}$/.test(a.idHash) ||
+        ids.has(a.idHash) ||
+        (a.completedHash !== undefined &&
+          (typeof a.completedHash !== 'string' || !/^[a-f0-9]{64}$/.test(a.completedHash)))
+      )
+        return null;
+      ids.add(a.idHash);
+    }
+  } catch {
+    return null;
+  }
+  if (child.input.length < parent.input_count + announced.length) return null;
+  for (const a of announced) {
+    const item = child.input[parent.input_count + a.index];
+    if (
+      item.itemIdHash !== a.idHash ||
+      item.wireItemType !== a.type ||
+      (a.completedHash !== undefined && item.itemHash !== a.completedHash)
+    )
+      return null;
+  }
+  return parent.input_count + announced.length;
+}
 /** Only hashes and bounded summaries are stored; normalized text remains ephemeral. */
 export class ConversationIndex {
   constructor(readonly db: Database) {}
   prepare(normalized: NormalizedRequest, meta: IndexMeta): PreparedIndex {
     const n = normalized;
     let parent: Parent | null = null;
+    let parentCoverage = 0;
+    const announcedJson = n.announcementsValid ? JSON.stringify(n.announcedOutput) : '[]';
+    const announcementsValid =
+      n.announcementsValid &&
+      n.inputEligible &&
+      n.inputCount > 0 &&
+      n.announcedOutput.length > 0 &&
+      n.announcedOutput.length <= 256 &&
+      Buffer.byteLength(announcedJson) <= announcementLimit;
     if (n.chat && n.domain) {
       const domain = [meta.source, n.userId, n.tokenId, n.protocol];
       const scope = n.identity ? ' AND thread_key=?' : '';
@@ -159,24 +225,40 @@ export class ConversationIndex {
         if (rows.length === 1) parent = rows[0];
       } else {
         const hashes = n.inputPrefixes.slice(-4096);
-        let best = 0,
-          tied = false;
+        let best = 0;
+        const bestIds = new Set<number>();
+        const consider = (row: Parent, coverage: number, displayCoverage: number) => {
+          if (coverage > best) {
+            best = coverage;
+            parent = row;
+            parentCoverage = displayCoverage;
+            bestIds.clear();
+            bestIds.add(row.id);
+          } else if (coverage === best && bestIds.size < 2) bestIds.add(row.id);
+        };
         for (let i = 0; i < hashes.length; i += 500) {
           const batch = hashes.slice(i, i + 500);
-          const rows = this.db
+          for (const row of this.db
             .query<Parent, SQLQueryBindings[]>(
               `SELECT ${parentColumns} FROM requests WHERE source=? AND user_id=? AND token_id=? AND protocol=?${scope} AND completeness!='error' AND evidence_chain IN (${batch.map(() => '?').join(',')})`,
             )
-            .all(...args, ...batch);
-          for (const row of rows) {
-            if (row.evidence_count > best) {
-              best = row.evidence_count;
-              parent = row;
-              tied = false;
-            } else if (row.evidence_count === best && row.id !== parent?.id) tied = true;
+            .iterate(...args, ...batch))
+            consider(row, row.evidence_count, row.evidence_count);
+          if (n.identity) {
+            for (const row of this.db
+              .query<Parent, SQLQueryBindings[]>(
+                `SELECT ${parentColumns} FROM requests WHERE source=? AND user_id=? AND token_id=? AND protocol=? AND thread_key=? AND completeness='partial' AND announcements_valid=1 AND input_chain IN (${batch.map(() => '?').join(',')})`,
+              )
+              .iterate(...args, ...batch)) {
+              const coverage = announcementsMatch(row, n);
+              if (coverage !== null) consider(row, coverage, row.input_count);
+            }
           }
         }
-        if (tied) parent = null;
+        if (bestIds.size !== 1) {
+          parent = null;
+          parentCoverage = 0;
+        }
       }
     }
     let retry: Retry | null = null;
@@ -201,7 +283,7 @@ export class ConversationIndex {
           n.previousResponseId,
         );
     }
-    const start = n.previousResponseId ? 0 : parent ? parent.evidence_count : n.leadingHistoryCount;
+    const start = n.previousResponseId ? 0 : parent ? parentCoverage : n.leadingHistoryCount;
     const title = n.input.slice(start).find((m) => m.userText)?.userText || n.lastUserText;
     const usage = object(JSON.parse(meta.usage_json)),
       cost = object(JSON.parse(meta.cost_json));
@@ -209,6 +291,9 @@ export class ConversationIndex {
       normalized: n,
       parent,
       retry,
+      parentCoverage,
+      announcedJson: announcementsValid ? announcedJson : '[]',
+      announcementsValid,
       continuationEligible: n.previousResponseId
         ? n.completeness !== 'error' &&
           n.output.some(
@@ -242,6 +327,11 @@ export class ConversationIndex {
         live.completeness !== parent.completeness ||
         live.completeness === 'error' ||
         live.evidence_chain !== parent.evidence_chain ||
+        live.evidence_count !== parent.evidence_count ||
+        live.input_count !== parent.input_count ||
+        live.input_chain !== parent.input_chain ||
+        live.announced_output !== parent.announced_output ||
+        live.announcements_valid !== parent.announcements_valid ||
         live.response_id !== parent.response_id ||
         (n.identity && live.thread_key !== n.identity.threadKey)
       )
@@ -379,6 +469,8 @@ export class ConversationIndex {
       input_count: n.inputCount,
       evidence_count: n.evidenceCount,
       input_chain: n.inputChain,
+      announced_output: prepared.announcedJson,
+      announcements_valid: prepared.announcementsValid ? 1 : 0,
       retry_input_chain: n.retryInputChain,
       previous_response_id: n.previousResponseId,
       retry_of: retry?.id ?? null,
@@ -392,7 +484,7 @@ export class ConversationIndex {
       link_rule: rule,
       conversation_id: conversation?.id ?? null,
       turn_index: turn,
-      parent_coverage: parent && !n.previousResponseId ? parent.evidence_count : 0,
+      parent_coverage: parent && !n.previousResponseId ? prepared.parentCoverage : 0,
       client_kind: n.identity?.clientKind ?? null,
       thread_key: n.identity?.threadKey ?? null,
       session_key: n.identity?.sessionKey ?? null,
@@ -711,7 +803,7 @@ export function backfillConversations(db: Database, restore: (id: number) => Uin
           ).run(...Object.values(row));
         }
       }
-      db.exec('PRAGMA user_version=4');
+      db.exec('PRAGMA user_version=5');
     }).immediate();
   } finally {
     staged.close();
