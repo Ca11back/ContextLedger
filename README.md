@@ -6,7 +6,7 @@ new-api 自带的日志只记「谁、什么时候、用了多少 token」，不
 
 ## 由两部分组成
 
-- **插件**（[plugins/new-api-report.js](plugins/new-api-report.js)）：装在 new-api 里。每次请求结束，它把内容整理一下，发给记录服务。
+- **插件**（[plugins/ca11back_contextledger/plugin.js](plugins/ca11back_contextledger/plugin.js)）：装在 new-api 里。每次请求结束，它把内容整理一下，发给记录服务。
 - **记录服务**：一个独立的小程序，负责收、存，并提供一个只有管理员能登录的网页。
 
 ## 存哪些内容
@@ -14,7 +14,7 @@ new-api 自带的日志只记「谁、什么时候、用了多少 token」，不
 插件会先把内容精简一下，只留人看得懂、有审计价值的部分：
 
 - **加密字段不存**。像 `encrypted_content` 这种，人看不懂，也没法审计。
-- **流式回复只存最终结果**。只要最终回复确实包含了中间那些零碎片段的内容，就只存最终版。
+- **Responses 流式回复优先存最终结果**。只要能验证最终回复覆盖了中间片段，就保存最终版；无法验证时保留收到的事件。其他协议的流式内容在网页读取时拼接展示。
 - **图片不存原图**。new-api 自己会把图片换成 `[media:N]` 这样的占位符。
 
 ## 大对话怎么传
@@ -38,6 +38,16 @@ new-api 自带的日志只记「谁、什么时候、用了多少 token」，不
 - 存下来的是插件整理后发过来的内容，不是网关上原始的网络数据。
 
 没传完的记录会单独列出来，不会冒充完整记录。
+
+## 网页怎么看
+
+网页默认按会话阅读，也可以切到请求列表，或粘贴 new-api 的请求编号直接定位。
+
+- Codex 请求体带有线程声明时，同一线程的上下文压缩会保留在原线程组里，并标记上下文变化；内容分叉单独展示来源。
+- 客户端明确声明的子代理会显示父线程和名称，不从聊天内容猜测代理关系。
+- 其他客户端按可验证的内容前缀连接；无法确定时另开会话，因此可能出现断开的记录。
+- OpenAI Chat、Responses、Claude 和 Gemini 的可识别回复显示为消息、工具调用和工具结果。不完整或异常的回复会单独标记。
+- 每轮的「原始数据」可以分段查看实际存下来的内容。图片只显示占位或描述，日志里的远程资源不会自动加载。
 
 ## 空间管理
 
@@ -76,14 +86,14 @@ bun --env-file=.env run start
 ## 接到 new-api 上
 
 1. 部署记录服务，保证 new-api 能访问到它，比如放进同一个 Docker 网络。步骤见 [deploy/README.md](deploy/README.md)。
-2. 在 new-api 后台的「插件」页面上传 [plugins/new-api-report.js](plugins/new-api-report.js)。
+2. 在 new-api 后台的「插件」页面上传 [plugins/ca11back_contextledger/plugin.js](plugins/ca11back_contextledger/plugin.js)，同目录的 `icon.png` 可以作为图标一起上传。
 3. 新建一个请求处理实例，填三项：
    - `url`：记录服务的接收地址，例如 `http://contextledger:3000/api/ingest`
    - `token`：上面设的 `LEDGER_INGEST_TOKEN`
    - `source`：和上面的 `LEDGER_SOURCE` 填一样的
 4. 启用实例。之后有请求经过，刷新记录服务的网页就能看到。
 
-插件 0.2.0 要配合服务端 0.3.0 用。旧的 0.1.0 插件和它不兼容。
+插件 key 是 `ca11back_contextledger`，版本 0.3.0，配合服务端 0.3.0 使用。插件目录里还有给 new-api 插件市场用的 [说明](plugins/ca11back_contextledger/README.zh-CN.md) 和 [更新日志](plugins/ca11back_contextledger/CHANGELOG.zh-CN.md)。
 
 ## 更多
 

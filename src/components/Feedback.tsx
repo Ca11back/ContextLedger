@@ -1,22 +1,31 @@
-import { Icon } from './Icon';
-export function Feedback({ error, retry }: { error: Error; retry: () => void }) {
+import type { ReactNode } from 'react';
+
+export function ErrorState({ error, retry }: { error: Error; retry?: () => void }) {
   return (
-    <div className="feedback error" role="alert">
+    <div className="state error" role="alert">
       <p>{error.message}</p>
-      <button type="button" onClick={retry}>
-        重试
-      </button>
+      {retry && (
+        <button type="button" className="ghost" onClick={retry}>
+          重试
+        </button>
+      )}
     </div>
   );
 }
-export function Empty({ title, children }: { title: string; children: React.ReactNode }) {
+
+export function EmptyState({ title, children }: { title: string; children?: ReactNode }) {
   return (
-    <div className="empty">
-      <span className="empty-symbol" aria-hidden="true">
-        <Icon name="records" size={22} />
-      </span>
+    <div className="state empty">
       <h3>{title}</h3>
-      <p>{children}</p>
+      {children && <p>{children}</p>}
     </div>
+  );
+}
+
+export function Loading({ label }: { label: string }) {
+  return (
+    <p className="state loading" role="status">
+      {label}
+    </p>
   );
 }

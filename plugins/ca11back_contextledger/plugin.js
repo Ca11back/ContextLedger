@@ -1,13 +1,17 @@
-// External artifact for new-api apiVersion 1. Install only in an explicitly authorized gateway.
+// ContextLedger request plugin for new-api apiVersion 1.
+// Sends each finished request to a self-hosted ContextLedger service: https://github.com/Ca11back/ContextLedger
 export const meta = {
-  apiVersion: 1, key: 'contextledger-report', name: 'ContextLedger Report', version: '0.2.0',
-  author: { name: 'ContextLedger' },
-  description: { en: 'Readable report profile: opaque fields omitted; verified final Responses preferred.' },
+  apiVersion: 1, key: 'ca11back_contextledger', name: 'ContextLedger', version: '0.3.0',
+  author: { name: 'Ca11back', url: 'https://github.com/Ca11back' },
+  description: {
+    en: 'ContextLedger: save readable request and reply content for admin audit',
+    'zh-CN': 'ContextLedger：保存可读的请求和回复内容，供管理员审计',
+  },
   configSchema: {
     type: 'object', properties: {
-      url: { type: 'string', format: 'url', title: { en: 'Ingestion URL' } },
-      token: { type: 'string', format: 'password', title: { en: 'Ingestion token' } },
-      source: { type: 'string', title: { en: 'Source identity' } },
+      url: { type: 'string', format: 'url', title: { en: 'Ingestion URL', 'zh-CN': '接收地址' } },
+      token: { type: 'string', format: 'password', title: { en: 'Ingestion token', 'zh-CN': '上传令牌' } },
+      source: { type: 'string', title: { en: 'Source identity', 'zh-CN': '来源名称' } },
     }, required: ['url', 'token', 'source'],
   },
 };
@@ -242,6 +246,7 @@ export function partitionEnvelope(envelope) {
 }
 export function createTransfer(ctx, record, uploadId) { return partitionEnvelope(createEnvelope(ctx,record,uploadId)); }
 export function report(ctx, record) {
+  if (ctx.format === 'embedding') return;
   const transfer = createTransfer(ctx,record,utils.uuid()); let body = transfer.manifestBody;
   for (let call = 0; call < 4; call++) {
     const result = utils.fetch({url:ctx.config.url,method:'POST',headers:{'Content-Type':'application/json',Authorization:'Bearer ' + ctx.config.token},body});

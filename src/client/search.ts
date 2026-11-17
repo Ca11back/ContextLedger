@@ -1,45 +1,77 @@
-export const textFilters = ['request', 'model', 'channel', 'user', 'token'] as const;
-export const filterKeys = [...textFilters, 'outcome', 'truncated', 'media', 'from', 'to'] as const;
-export type FilterKey = (typeof filterKeys)[number];
-export type DashboardSearch = Partial<Record<FilterKey, string>> & {
-  view?: 'uploads';
-  selected?: number;
-};
+// URL state for the single-screen UI. Everything the user can share or refresh lives here.
 
-function integer(value: unknown): number | undefined {
-  if (typeof value !== 'string' && typeof value !== 'number') return;
-  if (!/^\d+$/.test(String(value))) return;
-  const number = Number(value);
-  return Number.isSafeInteger(number) && number >= 0 ? number : undefined;
+export const filterKeys = ['user', 'token', 'model', 'status', 'kind', 'from', 'to'] as const;
+export type FilterKey = (typeof filterKeys)[number];
+export const statusValues = ['error', 'partial', 'media'] as const;
+export const kindValues = ['main', 'subagent'] as const;
+
+export interface AppSearch {
+  tab?: 'requests';
+  /** Open conversation. */
+  c?: number;
+  /** Anchored turn inside the open conversation. */
+  t?: number;
+  /** Open single request (requests without a conversation). */
+  r?: number;
+  user?: string;
+  token?: string;
+  model?: string;
+  status?: (typeof statusValues)[number];
+  kind?: (typeof kindValues)[number];
+  from?: number;
+  to?: number;
 }
 
-export function validateDashboardSearch(input: Record<string, unknown>): DashboardSearch {
-  const result: DashboardSearch = {};
-  for (const key of textFilters) {
-    const value = input[key];
-    if (typeof value === 'string' && value.length > 0 && value.length <= 512) result[key] = value;
+function positive(value: unknown): number | undefined {
+  if (typeof value !== 'string' && typeof value !== 'number') return;
+  if (!/^\d{1,15}$/.test(String(value))) return;
+  const number = Number(value);
+  return Number.isSafeInteger(number) && number > 0 ? number : undefined;
+}
+
+function text(value: unknown): string | undefined {
+  return typeof value === 'string' && value.length > 0 && value.length <= 256 ? value : undefined;
+}
+
+export function validateAppSearch(input: Record<string, unknown>): AppSearch {
+  const result: AppSearch = {};
+  if (input.tab === 'requests') result.tab = 'requests';
+  for (const key of ['c', 't', 'r', 'from', 'to'] as const) {
+    const value = positive(input[key]);
+    if (value !== undefined) result[key] = value;
   }
-  if (input.outcome === 'reported' || input.outcome === 'error') result.outcome = input.outcome;
-  for (const key of ['truncated', 'media'] as const)
-    if (input[key] === '0' || input[key] === '1') result[key] = input[key];
-  for (const key of ['from', 'to'] as const) {
-    const value = integer(input[key]);
-    if (value !== undefined) result[key] = String(value);
+  for (const key of ['user', 'token', 'model'] as const) {
+    const value = text(input[key]);
+    if (value !== undefined) result[key] = value;
   }
-  if (result.from && result.to && Number(result.from) > Number(result.to)) {
+  if (statusValues.includes(input.status as never))
+    result.status = input.status as AppSearch['status'];
+  if (kindValues.includes(input.kind as never)) result.kind = input.kind as AppSearch['kind'];
+  if (result.from && result.to && result.from > result.to) {
     delete result.from;
     delete result.to;
   }
-  if (input.view === 'uploads') result.view = 'uploads';
-  const selected = integer(input.selected);
-  if (selected && selected > 0) result.selected = selected;
+  if (!result.c) delete result.t;
   return result;
 }
 
-export function recordParams(search: DashboardSearch, cursor?: number): URLSearchParams {
+export function hasFilters(search: AppSearch): boolean {
+  return filterKeys.some((key) => search[key] !== undefined);
+}
+
+export function listParams(
+  search: AppSearch,
+  cursor: string | null | undefined,
+  keys: readonly FilterKey[],
+): URLSearchParams {
   const params = new URLSearchParams();
-  for (const key of filterKeys) if (search[key] !== undefined) params.set(key, search[key]);
-  params.set('limit', '25');
-  if (cursor !== undefined) params.set('cursor', String(cursor));
+  for (const key of keys) {
+    const value = search[key];
+    if (value !== undefined) params.set(key, String(value));
+  }
+  if (cursor) params.set('cursor', cursor);
   return params;
 }
+
+export const conversationFilterKeys = filterKeys;
+export const requestFilterKeys = ['user', 'token', 'model', 'status', 'from', 'to'] as const;

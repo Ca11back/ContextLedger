@@ -1,99 +1,89 @@
 import { expect, test } from 'bun:test';
 import { QueryClientProvider } from '@tanstack/react-query';
 import { renderToStaticMarkup } from 'react-dom/server';
-import { createDashboardQueryClient, recordViewQuery } from '../src/client/queries';
-import { RecordInspector } from '../src/components/RecordInspector';
-import { Uploads } from '../src/components/Uploads';
-import type { RecordView } from '../src/view-contracts';
+import { createDashboardQueryClient } from '../src/client/queries';
+import type { MessageView } from '../src/client/transcript';
+import { Message } from '../src/components/Message';
 
-test('shipped inspector escapes report metadata and states capture and cost boundaries', () => {
+function render(message: MessageView) {
   const client = createDashboardQueryClient();
-  const view: RecordView = {
-    meta: {
-      id: 1,
-      received_at: 0,
-      source: '<script>source</script>',
-      upload_id: 'synthetic-upload',
-      host_request_id: '<img src="https://private.example/picture">',
-      model: '<script>model</script>',
-      channel: 'synthetic-channel',
-      user_label: 'synthetic-user',
-      token_label: 'synthetic-token',
-      outcome: 'reported',
-      truncated: 1,
-      media: 1,
-      duration_ms: null,
-      usage_json: '{}',
-      cost_json: '{}',
-      body_hash: 'a'.repeat(64),
-      body_length: 1000,
-      storage_mode: 'item_cas',
-    },
-    path: [],
-    node: { kind: 'object', preview: '', count: 1 },
-    entries: [],
-    text: null,
-    offset: 0,
-    nextOffset: null,
-    total: 1,
-    sections: [{ id: 'raw', label: '完整结构', path: [] }],
-  };
-  client.setQueryData(recordViewQuery(1, [], 0).queryKey, view);
   try {
-    const html = renderToStaticMarkup(
+    return renderToStaticMarkup(
       <QueryClientProvider client={client}>
-        <RecordInspector id={1} close={() => {}} />
+        <Message message={message} />
       </QueryClientProvider>,
     );
-    expect(html).toContain('&lt;script&gt;model&lt;/script&gt;');
-    expect(html).toContain('&lt;script&gt;source&lt;/script&gt;');
-    expect(html).toContain('&lt;img src=');
-    expect(html).toContain('网关已截断，部分内容缺失');
-    expect(html).toContain('内联媒体已遮罩');
-    expect(html).toContain('上游采购成本');
-    expect(html).toContain('未知');
-    expect(html).toContain('链接保持文本，不加载外部资源');
-    expect(html).not.toContain('<script>');
-    expect(html).not.toContain('<img');
-    expect(html).not.toContain('href=');
   } finally {
     client.clear();
   }
-});
+}
 
-test('shipped upload panel escapes unverified hints without presenting partial evidence as complete', () => {
-  const html = renderToStaticMarkup(
-    <Uploads
-      uploads={[
-        {
-          upload_id: 'synthetic-upload',
-          state: 'partial',
-          reason: '<script>reason</script>',
-          created_at: 0,
-          expires_at: 1000,
-          completed_at: null,
-          record_id: null,
-          envelope_bytes: 1000,
-          missing_count: 2,
-          missing_bytes: 500,
-          hint: {
-            request_id: '<img src="https://private.example/picture">',
-            context: { model: '<script>model</script>' },
-          },
-          hint_verified: false,
-        },
-      ]}
-      select={() => {}}
-    />,
-  );
-  expect(html).toContain('部分上传');
-  expect(html).toContain('生产方提示 · 未经独立校验');
-  expect(html).toContain('无已校验记录');
-  expect(html).toContain('&lt;script&gt;model&lt;/script&gt;');
-  expect(html).toContain('&lt;script&gt;reason&lt;/script&gt;');
-  expect(html).toContain('&lt;img src=');
+const base = {
+  messageId: 'm',
+  turnIndex: 1,
+  side: 'input' as const,
+  partCount: 1,
+};
+
+test('messages render report content as escaped text, never markup or remote media', () => {
+  const html = render({
+    ...base,
+    kind: 'user',
+    parts: [
+      {
+        partIndex: 0,
+        partKind: 'text',
+        partTotal: 60,
+        text: '<script>alert(1)</script><img src="https://private.example/x">',
+        continuation: null,
+      },
+    ],
+  });
+  expect(html).toContain('&lt;script&gt;alert(1)&lt;/script&gt;');
   expect(html).not.toContain('<script>');
   expect(html).not.toContain('<img');
   expect(html).not.toContain('href=');
-  expect(html).not.toContain('查看 #');
+});
+
+test('tool results are folded to three lines and masked media is a label only', () => {
+  const lines = Array.from({ length: 10 }, (_, index) => `line ${index}`).join('\n');
+  const tool = render({
+    ...base,
+    kind: 'tool_result',
+    name: '<b>shell</b>',
+    parts: [
+      { partIndex: 0, partKind: 'text', partTotal: lines.length, text: lines, continuation: null },
+    ],
+  });
+  expect(tool).toContain('line 2');
+  expect(tool).not.toContain('line 3');
+  expect(tool).toContain('共 10 行');
+  expect(tool).toContain('&lt;b&gt;shell&lt;/b&gt;');
+  const media = render({
+    ...base,
+    kind: 'media',
+    partCount: 0,
+    media: { label: 'image/png · <img src=x>' },
+    parts: [],
+  });
+  expect(media).toContain('已由网关遮罩');
+  expect(media).toContain('&lt;img src=x&gt;');
+  expect(media).not.toContain('<img');
+});
+
+test('a long part offers continuation with loaded and total size', () => {
+  const html = render({
+    ...base,
+    kind: 'assistant',
+    parts: [
+      {
+        partIndex: 0,
+        partKind: 'text',
+        partTotal: 20000,
+        text: 'a'.repeat(8192),
+        continuation: 'next',
+      },
+    ],
+  });
+  expect(html).toContain('继续载入（已显示 8,192 / 20,000 字）');
 });

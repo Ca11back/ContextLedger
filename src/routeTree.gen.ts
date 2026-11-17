@@ -11,11 +11,18 @@
 import { Route as rootRouteImport } from './routes/__root'
 import { Route as IndexRouteImport } from './routes/index'
 import { Route as HealthzRouteImport } from './routes/healthz'
+import { Route as ApiConversationsRouteImport } from './routes/api.conversations'
 import { Route as ApiIngestRouteImport } from './routes/api.ingest'
+import { Route as ApiLookupRouteImport } from './routes/api.lookup'
 import { Route as ApiMetricsRouteImport } from './routes/api.metrics'
-import { Route as ApiRecordsRouteImport } from './routes/api.records'
+import { Route as ApiRequestsRouteImport } from './routes/api.requests'
 import { Route as ApiUploadsRouteImport } from './routes/api.uploads'
-import { Route as ApiRecordsIdRouteImport } from './routes/api.records.$id'
+import { Route as ApiConversationsIdRouteImport } from './routes/api.conversations.$id'
+import { Route as ApiTextContinuationRouteImport } from './routes/api.text.$continuation'
+import { Route as ApiConversationsIdBranchesRouteImport } from './routes/api.conversations.$id.branches'
+import { Route as ApiConversationsIdFragmentsRouteImport } from './routes/api.conversations.$id.fragments'
+import { Route as ApiConversationsIdSubagentsRouteImport } from './routes/api.conversations.$id.subagents'
+import { Route as ApiConversationsIdTurnsRouteImport } from './routes/api.conversations.$id.turns'
 import { Route as ApiRecordsIdViewRouteImport } from './routes/api.records.$id.view'
 
 const IndexRoute = IndexRouteImport.update({
@@ -28,9 +35,19 @@ const HealthzRoute = HealthzRouteImport.update({
   path: '/healthz',
   getParentRoute: () => rootRouteImport,
 } as any)
+const ApiConversationsRoute = ApiConversationsRouteImport.update({
+  id: '/api/conversations',
+  path: '/api/conversations',
+  getParentRoute: () => rootRouteImport,
+} as any)
 const ApiIngestRoute = ApiIngestRouteImport.update({
   id: '/api/ingest',
   path: '/api/ingest',
+  getParentRoute: () => rootRouteImport,
+} as any)
+const ApiLookupRoute = ApiLookupRouteImport.update({
+  id: '/api/lookup',
+  path: '/api/lookup',
   getParentRoute: () => rootRouteImport,
 } as any)
 const ApiMetricsRoute = ApiMetricsRouteImport.update({
@@ -38,9 +55,9 @@ const ApiMetricsRoute = ApiMetricsRouteImport.update({
   path: '/api/metrics',
   getParentRoute: () => rootRouteImport,
 } as any)
-const ApiRecordsRoute = ApiRecordsRouteImport.update({
-  id: '/api/records',
-  path: '/api/records',
+const ApiRequestsRoute = ApiRequestsRouteImport.update({
+  id: '/api/requests',
+  path: '/api/requests',
   getParentRoute: () => rootRouteImport,
 } as any)
 const ApiUploadsRoute = ApiUploadsRouteImport.update({
@@ -48,46 +65,95 @@ const ApiUploadsRoute = ApiUploadsRouteImport.update({
   path: '/api/uploads',
   getParentRoute: () => rootRouteImport,
 } as any)
-const ApiRecordsIdRoute = ApiRecordsIdRouteImport.update({
+const ApiConversationsIdRoute = ApiConversationsIdRouteImport.update({
   id: '/$id',
   path: '/$id',
-  getParentRoute: () => ApiRecordsRoute,
+  getParentRoute: () => ApiConversationsRoute,
+} as any)
+const ApiTextContinuationRoute = ApiTextContinuationRouteImport.update({
+  id: '/api/text/$continuation',
+  path: '/api/text/$continuation',
+  getParentRoute: () => rootRouteImport,
+} as any)
+const ApiConversationsIdBranchesRoute =
+  ApiConversationsIdBranchesRouteImport.update({
+    id: '/branches',
+    path: '/branches',
+    getParentRoute: () => ApiConversationsIdRoute,
+  } as any)
+const ApiConversationsIdFragmentsRoute =
+  ApiConversationsIdFragmentsRouteImport.update({
+    id: '/fragments',
+    path: '/fragments',
+    getParentRoute: () => ApiConversationsIdRoute,
+  } as any)
+const ApiConversationsIdSubagentsRoute =
+  ApiConversationsIdSubagentsRouteImport.update({
+    id: '/subagents',
+    path: '/subagents',
+    getParentRoute: () => ApiConversationsIdRoute,
+  } as any)
+const ApiConversationsIdTurnsRoute = ApiConversationsIdTurnsRouteImport.update({
+  id: '/turns',
+  path: '/turns',
+  getParentRoute: () => ApiConversationsIdRoute,
 } as any)
 const ApiRecordsIdViewRoute = ApiRecordsIdViewRouteImport.update({
-  id: '/view',
-  path: '/view',
-  getParentRoute: () => ApiRecordsIdRoute,
+  id: '/api/records/$id/view',
+  path: '/api/records/$id/view',
+  getParentRoute: () => rootRouteImport,
 } as any)
 
 export interface FileRoutesByFullPath {
   '/': typeof IndexRoute
   '/healthz': typeof HealthzRoute
+  '/api/conversations': typeof ApiConversationsRouteWithChildren
   '/api/ingest': typeof ApiIngestRoute
+  '/api/lookup': typeof ApiLookupRoute
   '/api/metrics': typeof ApiMetricsRoute
-  '/api/records': typeof ApiRecordsRouteWithChildren
+  '/api/requests': typeof ApiRequestsRoute
   '/api/uploads': typeof ApiUploadsRoute
-  '/api/records/$id': typeof ApiRecordsIdRouteWithChildren
+  '/api/conversations/$id': typeof ApiConversationsIdRouteWithChildren
+  '/api/text/$continuation': typeof ApiTextContinuationRoute
+  '/api/conversations/$id/branches': typeof ApiConversationsIdBranchesRoute
+  '/api/conversations/$id/fragments': typeof ApiConversationsIdFragmentsRoute
+  '/api/conversations/$id/subagents': typeof ApiConversationsIdSubagentsRoute
+  '/api/conversations/$id/turns': typeof ApiConversationsIdTurnsRoute
   '/api/records/$id/view': typeof ApiRecordsIdViewRoute
 }
 export interface FileRoutesByTo {
   '/': typeof IndexRoute
   '/healthz': typeof HealthzRoute
+  '/api/conversations': typeof ApiConversationsRouteWithChildren
   '/api/ingest': typeof ApiIngestRoute
+  '/api/lookup': typeof ApiLookupRoute
   '/api/metrics': typeof ApiMetricsRoute
-  '/api/records': typeof ApiRecordsRouteWithChildren
+  '/api/requests': typeof ApiRequestsRoute
   '/api/uploads': typeof ApiUploadsRoute
-  '/api/records/$id': typeof ApiRecordsIdRouteWithChildren
+  '/api/conversations/$id': typeof ApiConversationsIdRouteWithChildren
+  '/api/text/$continuation': typeof ApiTextContinuationRoute
+  '/api/conversations/$id/branches': typeof ApiConversationsIdBranchesRoute
+  '/api/conversations/$id/fragments': typeof ApiConversationsIdFragmentsRoute
+  '/api/conversations/$id/subagents': typeof ApiConversationsIdSubagentsRoute
+  '/api/conversations/$id/turns': typeof ApiConversationsIdTurnsRoute
   '/api/records/$id/view': typeof ApiRecordsIdViewRoute
 }
 export interface FileRoutesById {
   __root__: typeof rootRouteImport
   '/': typeof IndexRoute
   '/healthz': typeof HealthzRoute
+  '/api/conversations': typeof ApiConversationsRouteWithChildren
   '/api/ingest': typeof ApiIngestRoute
+  '/api/lookup': typeof ApiLookupRoute
   '/api/metrics': typeof ApiMetricsRoute
-  '/api/records': typeof ApiRecordsRouteWithChildren
+  '/api/requests': typeof ApiRequestsRoute
   '/api/uploads': typeof ApiUploadsRoute
-  '/api/records/$id': typeof ApiRecordsIdRouteWithChildren
+  '/api/conversations/$id': typeof ApiConversationsIdRouteWithChildren
+  '/api/text/$continuation': typeof ApiTextContinuationRoute
+  '/api/conversations/$id/branches': typeof ApiConversationsIdBranchesRoute
+  '/api/conversations/$id/fragments': typeof ApiConversationsIdFragmentsRoute
+  '/api/conversations/$id/subagents': typeof ApiConversationsIdSubagentsRoute
+  '/api/conversations/$id/turns': typeof ApiConversationsIdTurnsRoute
   '/api/records/$id/view': typeof ApiRecordsIdViewRoute
 }
 export interface FileRouteTypes {
@@ -95,41 +161,66 @@ export interface FileRouteTypes {
   fullPaths:
     | '/'
     | '/healthz'
+    | '/api/conversations'
     | '/api/ingest'
+    | '/api/lookup'
     | '/api/metrics'
-    | '/api/records'
+    | '/api/requests'
     | '/api/uploads'
-    | '/api/records/$id'
+    | '/api/conversations/$id'
+    | '/api/text/$continuation'
+    | '/api/conversations/$id/branches'
+    | '/api/conversations/$id/fragments'
+    | '/api/conversations/$id/subagents'
+    | '/api/conversations/$id/turns'
     | '/api/records/$id/view'
   fileRoutesByTo: FileRoutesByTo
   to:
     | '/'
     | '/healthz'
+    | '/api/conversations'
     | '/api/ingest'
+    | '/api/lookup'
     | '/api/metrics'
-    | '/api/records'
+    | '/api/requests'
     | '/api/uploads'
-    | '/api/records/$id'
+    | '/api/conversations/$id'
+    | '/api/text/$continuation'
+    | '/api/conversations/$id/branches'
+    | '/api/conversations/$id/fragments'
+    | '/api/conversations/$id/subagents'
+    | '/api/conversations/$id/turns'
     | '/api/records/$id/view'
   id:
     | '__root__'
     | '/'
     | '/healthz'
+    | '/api/conversations'
     | '/api/ingest'
+    | '/api/lookup'
     | '/api/metrics'
-    | '/api/records'
+    | '/api/requests'
     | '/api/uploads'
-    | '/api/records/$id'
+    | '/api/conversations/$id'
+    | '/api/text/$continuation'
+    | '/api/conversations/$id/branches'
+    | '/api/conversations/$id/fragments'
+    | '/api/conversations/$id/subagents'
+    | '/api/conversations/$id/turns'
     | '/api/records/$id/view'
   fileRoutesById: FileRoutesById
 }
 export interface RootRouteChildren {
   IndexRoute: typeof IndexRoute
   HealthzRoute: typeof HealthzRoute
+  ApiConversationsRoute: typeof ApiConversationsRouteWithChildren
   ApiIngestRoute: typeof ApiIngestRoute
+  ApiLookupRoute: typeof ApiLookupRoute
   ApiMetricsRoute: typeof ApiMetricsRoute
-  ApiRecordsRoute: typeof ApiRecordsRouteWithChildren
+  ApiRequestsRoute: typeof ApiRequestsRoute
   ApiUploadsRoute: typeof ApiUploadsRoute
+  ApiTextContinuationRoute: typeof ApiTextContinuationRoute
+  ApiRecordsIdViewRoute: typeof ApiRecordsIdViewRoute
 }
 
 declare module '@tanstack/react-router' {
@@ -148,11 +239,25 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof HealthzRouteImport
       parentRoute: typeof rootRouteImport
     }
+    '/api/conversations': {
+      id: '/api/conversations'
+      path: '/api/conversations'
+      fullPath: '/api/conversations'
+      preLoaderRoute: typeof ApiConversationsRouteImport
+      parentRoute: typeof rootRouteImport
+    }
     '/api/ingest': {
       id: '/api/ingest'
       path: '/api/ingest'
       fullPath: '/api/ingest'
       preLoaderRoute: typeof ApiIngestRouteImport
+      parentRoute: typeof rootRouteImport
+    }
+    '/api/lookup': {
+      id: '/api/lookup'
+      path: '/api/lookup'
+      fullPath: '/api/lookup'
+      preLoaderRoute: typeof ApiLookupRouteImport
       parentRoute: typeof rootRouteImport
     }
     '/api/metrics': {
@@ -162,11 +267,11 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof ApiMetricsRouteImport
       parentRoute: typeof rootRouteImport
     }
-    '/api/records': {
-      id: '/api/records'
-      path: '/api/records'
-      fullPath: '/api/records'
-      preLoaderRoute: typeof ApiRecordsRouteImport
+    '/api/requests': {
+      id: '/api/requests'
+      path: '/api/requests'
+      fullPath: '/api/requests'
+      preLoaderRoute: typeof ApiRequestsRouteImport
       parentRoute: typeof rootRouteImport
     }
     '/api/uploads': {
@@ -176,54 +281,97 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof ApiUploadsRouteImport
       parentRoute: typeof rootRouteImport
     }
-    '/api/records/$id': {
-      id: '/api/records/$id'
+    '/api/conversations/$id': {
+      id: '/api/conversations/$id'
       path: '/$id'
-      fullPath: '/api/records/$id'
-      preLoaderRoute: typeof ApiRecordsIdRouteImport
-      parentRoute: typeof ApiRecordsRoute
+      fullPath: '/api/conversations/$id'
+      preLoaderRoute: typeof ApiConversationsIdRouteImport
+      parentRoute: typeof ApiConversationsRoute
+    }
+    '/api/text/$continuation': {
+      id: '/api/text/$continuation'
+      path: '/api/text/$continuation'
+      fullPath: '/api/text/$continuation'
+      preLoaderRoute: typeof ApiTextContinuationRouteImport
+      parentRoute: typeof rootRouteImport
+    }
+    '/api/conversations/$id/branches': {
+      id: '/api/conversations/$id/branches'
+      path: '/branches'
+      fullPath: '/api/conversations/$id/branches'
+      preLoaderRoute: typeof ApiConversationsIdBranchesRouteImport
+      parentRoute: typeof ApiConversationsIdRoute
+    }
+    '/api/conversations/$id/fragments': {
+      id: '/api/conversations/$id/fragments'
+      path: '/fragments'
+      fullPath: '/api/conversations/$id/fragments'
+      preLoaderRoute: typeof ApiConversationsIdFragmentsRouteImport
+      parentRoute: typeof ApiConversationsIdRoute
+    }
+    '/api/conversations/$id/subagents': {
+      id: '/api/conversations/$id/subagents'
+      path: '/subagents'
+      fullPath: '/api/conversations/$id/subagents'
+      preLoaderRoute: typeof ApiConversationsIdSubagentsRouteImport
+      parentRoute: typeof ApiConversationsIdRoute
+    }
+    '/api/conversations/$id/turns': {
+      id: '/api/conversations/$id/turns'
+      path: '/turns'
+      fullPath: '/api/conversations/$id/turns'
+      preLoaderRoute: typeof ApiConversationsIdTurnsRouteImport
+      parentRoute: typeof ApiConversationsIdRoute
     }
     '/api/records/$id/view': {
       id: '/api/records/$id/view'
-      path: '/view'
+      path: '/api/records/$id/view'
       fullPath: '/api/records/$id/view'
       preLoaderRoute: typeof ApiRecordsIdViewRouteImport
-      parentRoute: typeof ApiRecordsIdRoute
+      parentRoute: typeof rootRouteImport
     }
   }
 }
 
-interface ApiRecordsIdRouteChildren {
-  ApiRecordsIdViewRoute: typeof ApiRecordsIdViewRoute
+interface ApiConversationsIdRouteChildren {
+  ApiConversationsIdBranchesRoute: typeof ApiConversationsIdBranchesRoute
+  ApiConversationsIdFragmentsRoute: typeof ApiConversationsIdFragmentsRoute
+  ApiConversationsIdSubagentsRoute: typeof ApiConversationsIdSubagentsRoute
+  ApiConversationsIdTurnsRoute: typeof ApiConversationsIdTurnsRoute
 }
 
-const ApiRecordsIdRouteChildren: ApiRecordsIdRouteChildren = {
-  ApiRecordsIdViewRoute: ApiRecordsIdViewRoute,
+const ApiConversationsIdRouteChildren: ApiConversationsIdRouteChildren = {
+  ApiConversationsIdBranchesRoute: ApiConversationsIdBranchesRoute,
+  ApiConversationsIdFragmentsRoute: ApiConversationsIdFragmentsRoute,
+  ApiConversationsIdSubagentsRoute: ApiConversationsIdSubagentsRoute,
+  ApiConversationsIdTurnsRoute: ApiConversationsIdTurnsRoute,
 }
 
-const ApiRecordsIdRouteWithChildren = ApiRecordsIdRoute._addFileChildren(
-  ApiRecordsIdRouteChildren,
-)
+const ApiConversationsIdRouteWithChildren =
+  ApiConversationsIdRoute._addFileChildren(ApiConversationsIdRouteChildren)
 
-interface ApiRecordsRouteChildren {
-  ApiRecordsIdRoute: typeof ApiRecordsIdRouteWithChildren
+interface ApiConversationsRouteChildren {
+  ApiConversationsIdRoute: typeof ApiConversationsIdRouteWithChildren
 }
 
-const ApiRecordsRouteChildren: ApiRecordsRouteChildren = {
-  ApiRecordsIdRoute: ApiRecordsIdRouteWithChildren,
+const ApiConversationsRouteChildren: ApiConversationsRouteChildren = {
+  ApiConversationsIdRoute: ApiConversationsIdRouteWithChildren,
 }
 
-const ApiRecordsRouteWithChildren = ApiRecordsRoute._addFileChildren(
-  ApiRecordsRouteChildren,
-)
+const ApiConversationsRouteWithChildren =
+  ApiConversationsRoute._addFileChildren(ApiConversationsRouteChildren)
 
 const rootRouteChildren: RootRouteChildren = {
   IndexRoute: IndexRoute,
   HealthzRoute: HealthzRoute,
+  ApiConversationsRoute: ApiConversationsRouteWithChildren,
   ApiIngestRoute: ApiIngestRoute,
+  ApiLookupRoute: ApiLookupRoute,
   ApiMetricsRoute: ApiMetricsRoute,
-  ApiRecordsRoute: ApiRecordsRouteWithChildren,
+  ApiRequestsRoute: ApiRequestsRoute,
   ApiUploadsRoute: ApiUploadsRoute,
+  ApiTextContinuationRoute: ApiTextContinuationRoute,
+  ApiRecordsIdViewRoute: ApiRecordsIdViewRoute,
 }
 export const routeTree = rootRouteImport
   ._addFileChildren(rootRouteChildren)

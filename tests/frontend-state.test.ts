@@ -1,71 +1,155 @@
 import { expect, test } from 'bun:test';
-import { QueryObserver } from '@tanstack/react-query';
 import { createDashboardQueryClient } from '../src/client/queries';
-import { recordParams, validateDashboardSearch } from '../src/client/search';
+import {
+  conversationFilterKeys,
+  listParams,
+  requestFilterKeys,
+  validateAppSearch,
+} from '../src/client/search';
+import { appendChunk, buildTranscript, type MessageView } from '../src/client/transcript';
+import type { Fragment, TurnSummary } from '../src/conversation-contracts';
 
-test('URL state preserves exact filters and selection but rejects unsafe route parameters', () => {
-  const state = validateDashboardSearch({
-    request: 'req / 中文',
-    model: 'a+b',
-    selected: '42',
-    view: 'uploads',
-    cursor: 99,
-    truncated: '1',
-    media: 'maybe',
-    from: '123',
-    to: '456',
-  });
-  expect(state).toEqual({
-    request: 'req / 中文',
-    model: 'a+b',
-    selected: 42,
-    view: 'uploads',
-    truncated: '1',
-    from: '123',
-    to: '456',
-  });
-  const params = recordParams(state, 25);
-  expect(params.get('request')).toBe('req / 中文');
-  expect(params.get('cursor')).toBe('25');
-  expect(params.has('selected')).toBe(false);
-  expect(params.has('view')).toBe(false);
+test('URL state keeps conversation, turn and filters and rejects unsafe values', () => {
   expect(
-    validateDashboardSearch({
-      selected: '1e5',
-      request: ['x'],
-      model: 'a'.repeat(513),
-      from: '9007199254740992',
-      to: '-1',
-      outcome: '<script>',
+    validateAppSearch({
+      tab: 'requests',
+      c: '12',
+      t: '7',
+      r: 'x',
+      user: 'alice / 中文',
+      status: 'error',
+      kind: 'subagent',
+      from: '100',
+      to: '200',
+      extra: 'ignored',
     }),
-  ).toEqual({});
-  expect(validateDashboardSearch({ from: '20', to: '10' })).toEqual({});
+  ).toEqual({
+    tab: 'requests',
+    c: 12,
+    t: 7,
+    user: 'alice / 中文',
+    status: 'error',
+    kind: 'subagent',
+    from: 100,
+    to: 200,
+  });
+  expect(validateAppSearch({ t: '3' })).toEqual({});
+  expect(validateAppSearch({ c: '0', status: 'weird', kind: 'x' })).toEqual({});
+  expect(validateAppSearch({ from: '20', to: '10' })).toEqual({});
+  expect(validateAppSearch({ user: 'a'.repeat(257) })).toEqual({});
 });
 
-test('request-scoped clients isolate private query data; selection disposal cancels stale work', async () => {
-  const first = createDashboardQueryClient(),
-    second = createDashboardQueryClient();
-  first.setQueryData(['metrics'], { records: 123 });
+test('list parameters carry only the filters each list supports', () => {
+  const search = validateAppSearch({ c: '1', user: 'u', kind: 'main', status: 'partial' });
+  const conversations = listParams(search, 'cur', conversationFilterKeys);
+  expect(conversations.get('kind')).toBe('main');
+  expect(conversations.get('cursor')).toBe('cur');
+  expect(conversations.has('c')).toBe(false);
+  const requests = listParams(search, null, requestFilterKeys);
+  expect(requests.has('kind')).toBe(false);
+  expect(requests.get('status')).toBe('partial');
+});
+
+const turn = (turnIndex: number, extra: Partial<TurnSummary> = {}): TurnSummary => ({
+  turnIndex,
+  recordId: turnIndex,
+  requestId: `req-${turnIndex}`,
+  receivedAt: turnIndex * 1000,
+  model: 'synthetic-model',
+  inputTokens: 1,
+  outputTokens: 1,
+  charge: null,
+  durationMs: null,
+  completeness: 'complete',
+  linkRule: null,
+  parentOutputIncomplete: false,
+  contextReset: null,
+  media: false,
+  ...extra,
+});
+
+test('transcript folds fragments by turn, applies resets and never repeats or skips text', () => {
+  const fragments: Fragment[] = [
+    { type: 'turn', turn: turn(1) },
+    {
+      type: 'message',
+      messageId: 'm1',
+      turnIndex: 1,
+      side: 'input',
+      kind: 'user',
+      partCount: 1,
+    },
+    {
+      type: 'chunk',
+      messageId: 'm1',
+      partIndex: 0,
+      partKind: 'text',
+      offset: 0,
+      text: 'hello ',
+      nextOffset: 6,
+      partTotal: 11,
+      continuation: 'c1',
+    },
+    // A repeated page must not duplicate text.
+    {
+      type: 'chunk',
+      messageId: 'm1',
+      partIndex: 0,
+      partKind: 'text',
+      offset: 0,
+      text: 'hello ',
+      nextOffset: 6,
+      partTotal: 11,
+      continuation: 'c1',
+    },
+    { type: 'reset', turnIndex: 2, reason: 'window_changed' },
+    { type: 'turn', turn: turn(2) },
+    {
+      type: 'message',
+      messageId: 'm2',
+      turnIndex: 2,
+      side: 'input',
+      kind: 'media',
+      media: { label: 'image/png · 118 KB' },
+      partCount: 0,
+    },
+  ];
+  const turns = buildTranscript(fragments);
+  expect(turns.map((view) => view.turn.turnIndex)).toEqual([1, 2]);
+  expect(turns[1]?.reset).toBe('window_changed');
+  const message = turns[0]?.messages[0] as MessageView;
+  expect(message.parts[0]?.text).toBe('hello ');
+  expect(message.parts[0]?.continuation).toBe('c1');
+  // A gap is rejected; the exact continuation is accepted and ends the part.
+  expect(
+    appendChunk(message, {
+      partIndex: 0,
+      offset: 7,
+      text: 'x',
+      nextOffset: null,
+      partTotal: 11,
+      continuation: null,
+    }),
+  ).toBe(false);
+  expect(
+    appendChunk(message, {
+      partIndex: 0,
+      offset: 6,
+      text: 'world',
+      nextOffset: null,
+      partTotal: 11,
+      continuation: null,
+    }),
+  ).toBe(true);
+  expect(message.parts[0]?.text).toBe('hello world');
+  expect(message.parts[0]?.continuation).toBeNull();
+});
+
+test('request-scoped query clients do not share private data', () => {
+  const first = createDashboardQueryClient();
+  const second = createDashboardQueryClient();
+  first.setQueryData(['metrics'], { records: 1 });
   expect(second.getQueryData(['metrics'])).toBeUndefined();
-  let aborted = false;
-  const observer = new QueryObserver(first, {
-    queryKey: ['record-view', 1],
-    retry: false,
-    queryFn: ({ signal }) =>
-      new Promise((resolve, reject) => {
-        signal.addEventListener('abort', () => {
-          aborted = true;
-          reject(new DOMException('aborted', 'AbortError'));
-        });
-        setTimeout(() => resolve('old record'), 20);
-      }),
-  });
-  const unsubscribe = observer.subscribe(() => {});
-  await first.cancelQueries({ queryKey: ['record-view', 1] });
-  first.removeQueries({ queryKey: ['record-view', 1] });
-  unsubscribe();
-  expect(aborted).toBe(true);
-  expect(first.getQueryData(['record-view', 1])).toBeUndefined();
   first.clear();
   second.clear();
 });

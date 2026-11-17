@@ -4,10 +4,10 @@ import { runInNewContext } from 'node:vm';
 import { hash } from '../src/server/codec';
 
 const code =
-  readFileSync(new URL('../plugins/new-api-report.js', import.meta.url), 'utf8').replaceAll(
-    'export ',
-    '',
-  ) + '\nreport(ctx, record);';
+  readFileSync(
+    new URL('../plugins/ca11back_contextledger/plugin.js', import.meta.url),
+    'utf8',
+  ).replaceAll('export ', '') + '\nreport(ctx, record);';
 test('public plugin negotiates safe envelope with one manifest and onlymissing objects', () => {
   const calls: string[] = [],
     pieces = new Map<string, string>();
@@ -147,4 +147,18 @@ test('public plugin rejects failure/invalidack and percallbudget before fetch', 
     throw new Error('unexpected-fetch');
   };
   expect(() => runInNewContext(code, sandbox)).toThrow('contextledger_profile_budget');
+});
+
+test('embedding reporting returns before reading evidence, preparing or sending transfer', () => {
+  let used = false;
+  const fail = () => {
+    used = true;
+    throw new Error('embedding must not touch reporting');
+  };
+  runInNewContext(code, {
+    ctx: { format: 'embedding' },
+    record: new Proxy({}, { get: fail }),
+    utils: { uuid: fail, sha256: fail, fetch: fail },
+  });
+  expect(used).toBe(false);
 });

@@ -3,7 +3,7 @@ import { runInNewContext } from 'node:vm';
 import { hash } from '../src/server/codec';
 
 const plugin = readFileSync(
-  new URL('../plugins/new-api-report.js', import.meta.url),
+  new URL('../plugins/ca11back_contextledger/plugin.js', import.meta.url),
   'utf8',
 ).replaceAll('export ', '');
 export interface Transfer {

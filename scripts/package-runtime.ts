@@ -30,7 +30,7 @@ const sources = [
   'biome.json',
   'tsconfig.json',
   'deploy/Dockerfile.runtime',
-  'plugins/new-api-report.js',
+  'plugins/ca11back_contextledger/plugin.js',
 ];
 const sourceEntries = await Promise.all(
   sources.sort().map(async (path) => [path, hash(await readFile(path))]),

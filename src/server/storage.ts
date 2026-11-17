@@ -5,6 +5,8 @@ import { type Envelope, metadata, object, type RecordMeta } from '../contracts';
 import { decodeParts, hash, type Prepared, prepare, verify } from './codec';
 import type { Config } from './config';
 import { LedgerError } from './errors';
+import { backfillConversations, ConversationIndex, installConversationSchema } from './linking';
+import { normalizeEnvelope } from './normalize';
 
 interface Root extends RecordMeta {
   payload: Uint8Array;
@@ -31,6 +33,7 @@ export interface Metrics {
 }
 export class Ledger {
   readonly db: Database;
+  readonly conversations: ConversationIndex;
   private maintenanceRunning = false;
   private owner = crypto.randomUUID();
   private pressure: string | null = null;
@@ -58,7 +61,8 @@ export class Ledger {
       throw new Error('Database requires WAL mode');
     const version = (this.db.query('PRAGMA user_version').get() as { user_version: number })
       .user_version;
-    if (version !== 0 && version !== 2) throw new Error('Unsupported database format');
+    if (version !== 0 && version !== 2 && version !== 3)
+      throw new Error('Unsupported database format');
     this.db.exec(`CREATE TABLE IF NOT EXISTS requests (
       id INTEGER PRIMARY KEY AUTOINCREMENT, received_at INTEGER NOT NULL, source TEXT NOT NULL, upload_id TEXT NOT NULL,
       host_request_id TEXT NOT NULL, model TEXT NOT NULL, channel TEXT NOT NULL, user_label TEXT NOT NULL, token_label TEXT NOT NULL,
@@ -81,7 +85,19 @@ export class Ledger {
       CREATE INDEX IF NOT EXISTS uploads_state_time ON uploads(state,created_at);
       CREATE TABLE IF NOT EXISTS pending_pins(upload_id TEXT NOT NULL REFERENCES uploads(upload_id) ON DELETE CASCADE, hash TEXT NOT NULL, length INTEGER NOT NULL, idx INTEGER NOT NULL, priority INTEGER NOT NULL, PRIMARY KEY(upload_id,hash));
       CREATE INDEX IF NOT EXISTS pending_pins_hash ON pending_pins(hash);
-      PRAGMA user_version=2;`);
+      `);
+    try {
+      if (version === 2) backfillConversations(this.db, (id) => this.restore(id));
+      else if (version === 0)
+        this.transaction(() => {
+          installConversationSchema(this.db);
+          this.db.exec('PRAGMA user_version=3');
+        });
+      this.conversations = new ConversationIndex(this.db);
+    } catch (error) {
+      this.db.close();
+      throw error;
+    }
   }
   private transaction<T>(fn: () => T): T {
     return this.db.transaction(fn).immediate();
@@ -111,8 +127,16 @@ export class Ledger {
       reusable: free * page,
       logical:
         scalar(
-          'SELECT coalesce(sum(length(payload)+length(usage_json)+length(cost_json)+512),0) FROM requests',
-        ) + scalar('SELECT coalesce(sum(length(compressed)+128),0) FROM objects'),
+          "SELECT coalesce(sum(length(payload)+length(usage_json)+length(cost_json)+length(CAST(coalesce(response_id,'') AS BLOB))+length(CAST(coalesce(user_id,'') AS BLOB))+length(CAST(coalesce(token_id,'') AS BLOB))+length(CAST(protocol AS BLOB))+1536),0) FROM requests",
+        ) +
+        scalar('SELECT coalesce(sum(length(compressed)+128),0) FROM objects') +
+        scalar(
+          "SELECT coalesce(sum(length(CAST(title AS BLOB))+length(CAST(models AS BLOB))+length(CAST(coalesce(user_id,'') AS BLOB))+length(CAST(coalesce(token_id,'') AS BLOB))+length(CAST(protocol AS BLOB))+1024),0) FROM conversations",
+        ) +
+        scalar(
+          'SELECT coalesce(sum(length(CAST(user_id AS BLOB))+length(CAST(token_id AS BLOB))+length(CAST(protocol AS BLOB))+1024),0) FROM threads',
+        ) +
+        scalar('SELECT coalesce(sum(length(model)+128),0) FROM conversation_models'),
       records: scalar('SELECT count(*) FROM requests'),
       objects: scalar('SELECT count(*) FROM objects'),
       max: this.config.maxStorageBytes,
@@ -177,8 +201,17 @@ export class Ledger {
     }
     const prepared = options.prepared ?? (await prepare(bytes, options.forceWhole));
     const meta = metadata(envelope);
+    const normalized = normalizeEnvelope(envelope);
     // Conservative B-tree/WAL expansion reserve; reject an inadmissible single record before deleting history.
-    const baseCost = prepared.payload.length + 8192;
+    const baseCost =
+      prepared.payload.length +
+      16_384 +
+      Buffer.byteLength(normalized.responseId ?? '') +
+      3 *
+        (Buffer.byteLength(normalized.userId ?? '') +
+          Buffer.byteLength(normalized.tokenId ?? '') +
+          Buffer.byteLength(normalized.protocol)) +
+      Buffer.byteLength(meta.model);
     const cost =
       baseCost +
       [...prepared.objects.values()].reduce(
@@ -215,6 +248,12 @@ export class Ledger {
         verified.set(item.hash, current);
       }
     }
+    const indexMeta = {
+      ...meta,
+      source: envelope.source,
+      received_at: options.receivedAt ?? options.now?.() ?? Date.now(),
+    };
+    const conversationPrepared = this.conversations.prepare(normalized, indexMeta);
     return this.transaction(() => {
       const committedAt = options.now?.() ?? Date.now();
       const existing = this.db
@@ -292,6 +331,11 @@ export class Ledger {
           options.manifestHash ?? null,
         );
       const id = Number(result.lastInsertRowid);
+      this.conversations.insert(
+        id,
+        { ...indexMeta, received_at: options.receivedAt ?? committedAt },
+        conversationPrepared,
+      );
       if (options.finalizeUpload) {
         const changed = this.db
           .query(
@@ -381,7 +425,7 @@ export class Ledger {
     const limit = Math.min(50, requestedLimit);
     const rows = this.db
       .query<RecordMeta, (string | number)[]>(
-        `SELECT ${metaColumns} FROM requests ${where.length ? 'WHERE ' + where.join(' AND ') : ''} ORDER BY id DESC LIMIT ?`,
+        `SELECT ${metaColumns} FROM requests ${where.length ? `WHERE ${where.join(' AND ')}` : ''} ORDER BY id DESC LIMIT ?`,
       )
       .all(...args, limit + 1);
     const more = rows.length > limit;
@@ -401,6 +445,7 @@ export class Ledger {
         .run(ref);
       if (changed.changes !== 1) throw new LedgerError(500, 'refcount_integrity_error');
     }
+    this.conversations.remove(id);
     this.db.query('DELETE FROM requests WHERE id=?').run(id);
     this.db
       .query(
@@ -472,7 +517,10 @@ export class Ledger {
             `SELECT id FROM requests ${pressure ? '' : 'WHERE received_at<?'} ORDER BY received_at,id LIMIT 8`,
           )
           .all(...(pressure ? [] : [cutoff ?? -1]));
-        if (!ids.length) break;
+        if (!ids.length) {
+          this.transaction(() => this.conversations.cleanupThreads());
+          break;
+        }
         this.transaction(() => {
           const leaseCheck = this.db
             .query(
@@ -481,6 +529,7 @@ export class Ledger {
             .run(Date.now() + 10_000, this.owner, epoch, Date.now());
           if (leaseCheck.changes !== 1) throw new LedgerError(503, 'maintenance_lease_lost');
           for (const item of ids) this.deleteRoot(item.id);
+          this.conversations.cleanupThreads();
         });
         this.db.exec('PRAGMA incremental_vacuum(64)');
         if (!this.checkpoint()) {

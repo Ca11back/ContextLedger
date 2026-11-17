@@ -69,14 +69,14 @@ function child(value: unknown, key: string): unknown {
   return (value as Record<string, unknown>)[key];
 }
 
-function splitsSurrogate(value: string, offset: number): boolean {
+export function splitsSurrogate(value: string, offset: number): boolean {
   if (offset <= 0 || offset >= value.length) return false;
   const left = value.charCodeAt(offset - 1),
     right = value.charCodeAt(offset);
   return left >= 0xd800 && left <= 0xdbff && right >= 0xdc00 && right <= 0xdfff;
 }
 
-function safeEnd(value: string, end: number): number {
+export function safeEnd(value: string, end: number): number {
   return splitsSurrogate(value, end) ? end - 1 : end;
 }
 

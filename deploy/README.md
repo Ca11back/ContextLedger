@@ -71,10 +71,18 @@ docker compose -f /path/to/docker-compose.yml up -d --no-deps --no-build --pull 
 | `GET /healthz` | 无 | 健康检查 |
 | `POST /api/ingest` | Bearer | 插件上传（先发清单，再补传缺的片段） |
 | `GET /api/uploads` | Basic | 上传状态：没传完、已过期、已完成 |
-| `GET /api/records` | Basic | 记录列表，支持按请求、模型、渠道、用户、令牌、结果、时间等筛选 |
+| `GET /api/conversations` | Basic | 会话列表，支持用户、令牌、模型、状态、时间和主对话/子代理筛选 |
+| `GET /api/conversations/:id` | Basic | 会话概要、内容分支与客户端声明的子代理来源 |
+| `GET /api/conversations/:id/turns` | Basic | 分页读取轮次；`startTurn` 可直接定位请求 |
+| `GET /api/conversations/:id/fragments` | Basic | 分页读取消息描述和各文本部分的首块 |
+| `GET /api/conversations/:id/branches` / `subagents` | Basic | 分页读取内容分支或客户端声明的直接子代理 |
+| `GET /api/text/:continuation` | Basic | 按续读令牌读取下一块文本；响应给出下一枚令牌，末尾为 `null` |
+| `GET /api/requests` | Basic | 请求列表，附所属会话与轮次；非对话请求没有所属会话 |
+| `GET /api/lookup?q=<请求编号>` | Basic | 按 new-api 请求编号精确定位；编号重复时返回候选 |
 | `GET /api/records/:id/view` | Basic | 分段查看一条记录 |
-| `GET /api/records/:id` | Basic | 一次取回整条记录（网页本身不用，留给其他工具） |
 | `GET /api/metrics` | Basic | 存储用量和压力 |
+
+新增会话接口按实际 JSON 字节数限制每页最多 64 KiB；`cursor` 和文本续读令牌由服务端生成，不要自行修改。原来的记录列表和整条记录接口已移除，原始内容通过分段查看接口读取。
 
 ## 校验和备份
 
@@ -94,4 +102,4 @@ bun --env-file=/secure/maintenance.env run integrity --backup /另一块盘/back
 
 - 同一个数据库只能有一个服务进程。
 - new-api 对回复内容最多截取约 1 MiB；网关排队满、重启或上传失败时，个别请求可能漏记。
-- 插件 0.2.0 需要配合服务端 0.3.0；旧的 0.1.0 插件协议不兼容。
+- 插件 `ca11back_contextledger` 0.3.0 配合服务端 0.3.0 使用。
