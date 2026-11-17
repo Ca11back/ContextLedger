@@ -2,9 +2,6 @@ import { afterEach, expect, test } from 'bun:test';
 import { existsSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { estimatePartial } from '../.trellis/tasks/11-17-conversation-backend/research/partial-estimate';
-import { partialLoopFixtures } from '../.trellis/tasks/11-17-conversation-backend/research/partial-fixtures';
-import { estimateRetry } from '../.trellis/tasks/11-17-conversation-backend/research/retry-estimate';
 import type { Envelope } from '../src/contracts';
 import type { Fragment, FragmentPage } from '../src/conversation-contracts';
 import { hash } from '../src/server/codec';
@@ -25,6 +22,9 @@ import {
 import { LedgerError } from '../src/server/errors';
 import { canonicalJson } from '../src/server/normalize';
 import { Ledger } from '../src/server/storage';
+import { estimatePartial } from './support/partial-estimate';
+import { partialLoopFixtures } from './support/partial-fixtures';
+import { estimateRetry } from './support/retry-estimate';
 
 const fixtures: { store: Ledger; directory: string }[] = [];
 function fixture() {
