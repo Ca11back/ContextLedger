@@ -3,9 +3,12 @@ import { QueryClientProvider } from '@tanstack/react-query';
 import { renderToStaticMarkup } from 'react-dom/server';
 import { createDashboardQueryClient } from '../src/client/queries';
 import type { MessageView } from '../src/client/transcript';
+import { CaughtError } from '../src/components/Feedback';
 import { Message } from '../src/components/Message';
+import { RawDrawer } from '../src/components/RawDrawer';
 import { TurnBlock } from '../src/components/Reader';
 import type { TurnSummary } from '../src/conversation-contracts';
+import { WithRouter } from './support/router';
 
 function render(message: MessageView) {
   const client = createDashboardQueryClient();
@@ -119,7 +122,6 @@ test('superseded attempts are dimmed with a retry note and retries are labelled'
             anchored
             openRaw={() => {}}
             spurs={[]}
-            go={() => {}}
             search={{}}
           />
         </QueryClientProvider>,
@@ -191,7 +193,6 @@ test('only the last message of an open stream is still loading', () => {
             anchored={false}
             openRaw={() => {}}
             spurs={[]}
-            go={() => {}}
             search={{}}
             streamOpen={streamOpen}
           />
@@ -234,14 +235,15 @@ function renderTurnView(summary: TurnSummary, messages: MessageView[], anchored 
   try {
     return renderToStaticMarkup(
       <QueryClientProvider client={client}>
-        <TurnBlock
-          view={{ turn: summary, reset: null, messages }}
-          anchored={anchored}
-          openRaw={() => {}}
-          spurs={[{ id: 9, title: 'branch' }]}
-          go={() => {}}
-          search={{}}
-        />
+        <WithRouter>
+          <TurnBlock
+            view={{ turn: summary, reset: null, messages }}
+            anchored={anchored}
+            openRaw={() => {}}
+            spurs={[{ id: 9, title: 'branch' }]}
+            search={{ user: 'alice' }}
+          />
+        </WithRouter>
       </QueryClientProvider>,
     );
   } finally {
@@ -337,7 +339,6 @@ test('a pending reasoning message is not counted as empty', () => {
           anchored={false}
           openRaw={() => {}}
           spurs={[]}
-          go={() => {}}
           search={{}}
           streamOpen
         />
@@ -348,4 +349,50 @@ test('a pending reasoning message is not counted as empty', () => {
   } finally {
     client.clear();
   }
+});
+
+test('caught render errors show the error state with a retry', () => {
+  const html = renderToStaticMarkup(
+    <CaughtError title="阅读区出错了" error={new Error('<b>boom</b>')} reset={() => {}} />,
+  );
+  expect(html).toContain('role="alert"');
+  expect(html).toContain('阅读区出错了');
+  expect(html).toContain('&lt;b&gt;boom&lt;/b&gt;');
+  expect(html).toContain('重试');
+  expect(renderToStaticMarkup(<CaughtError error="plain" reset={() => {}} />)).toContain('plain');
+});
+
+test('raw drawer is a native dialog without hand-rolled modal semantics', () => {
+  const client = createDashboardQueryClient();
+  try {
+    const html = renderToStaticMarkup(
+      <QueryClientProvider client={client}>
+        <RawDrawer recordId={1} title="第 1 轮的原始数据" close={() => {}} />
+      </QueryClientProvider>,
+    );
+    expect(html).toStartWith('<dialog');
+    expect(html).toContain('closedby="any"');
+    expect(html).toMatch(/aria-labelledby="([^"]+)"[\s\S]*<h2 id="\1">第 1 轮的原始数据<\/h2>/);
+    // showModal() supplies these; the server markup must not be open or claim them itself.
+    expect(html).not.toMatch(/<dialog[^>]* open/);
+    expect(html).not.toContain('role="dialog"');
+    expect(html).not.toContain('aria-modal');
+  } finally {
+    client.clear();
+  }
+});
+
+test('collapsed turns only point aria-controls at content that exists', () => {
+  const summary = summaryOf({ completeness: 'error' });
+  const folded = renderTurnView(summary, [reply]);
+  expect(folded).toContain('aria-expanded="false"');
+  expect(folded).not.toContain('aria-controls');
+  const open = renderTurnView(summary, [reply], true);
+  expect(open).toContain('aria-controls="turn-6-content"');
+  expect(open).toContain('id="turn-6-content"');
+});
+
+test('fork spurs are links that keep the current filters', () => {
+  const html = renderTurnView(summaryOf({}), [reply]);
+  expect(html).toContain('<a class="link" href="/?c=9&amp;user=alice">');
 });

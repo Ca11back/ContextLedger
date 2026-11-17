@@ -1,9 +1,11 @@
 import { useInfiniteQuery } from '@tanstack/react-query';
+import { Link } from '@tanstack/react-router';
 import { useCallback, useEffect } from 'react';
 import { count, shortId, when } from '../client/format';
 import { conversationsQuery, requestsQuery } from '../client/queries';
-import { type AppSearch, hasFilters } from '../client/search';
+import { type AppSearch, hasFilters, validateAppSearch } from '../client/search';
 import { useSentinel } from '../client/sentinel';
+import { modalOpen } from '../client/shortcuts';
 import { EmptyState, ErrorState, Loading } from './Feedback';
 
 type Navigate = (next: AppSearch) => void;
@@ -123,6 +125,7 @@ function useRowKeys(ids: number[], current: number | undefined, open: (id: numbe
       )
         return;
       if (event.key !== 'j' && event.key !== 'k') return;
+      if (modalOpen()) return;
       const index = current === undefined ? -1 : ids.indexOf(current);
       const next = ids[event.key === 'j' ? index + 1 : Math.max(0, index - 1)];
       if (next !== undefined) {
@@ -138,7 +141,9 @@ function useRowKeys(ids: number[], current: number | undefined, open: (id: numbe
 export function ConversationList({ search, go }: { search: AppSearch; go: Navigate }) {
   const query = useInfiniteQuery(conversationsQuery(search));
   const rows = query.data?.pages.flatMap((page) => page.rows) ?? [];
-  const open = (id: number) => go({ ...search, c: id, t: undefined, r: undefined });
+  const target = (id: number) =>
+    validateAppSearch({ ...search, c: id, t: undefined, r: undefined });
+  const open = (id: number) => go(target(id));
   const sentinel = useAutoLoad(query);
   useRowKeys(
     rows.map((row) => row.id),
@@ -164,11 +169,12 @@ export function ConversationList({ search, go }: { search: AppSearch; go: Naviga
         <ul className="rows">
           {rows.map((row) => (
             <li key={row.id}>
-              <button
-                type="button"
+              <Link
+                to="/"
+                activeOptions={{ exact: true }}
+                search={target(row.id)}
                 className="row"
                 aria-current={search.c === row.id ? 'true' : undefined}
-                onClick={() => open(row.id)}
               >
                 <span className="row-title">{row.title || '（无标题）'}</span>
                 <span className="row-meta">
@@ -194,7 +200,7 @@ export function ConversationList({ search, go }: { search: AppSearch; go: Naviga
                   {row.hasError && <span className="tag danger">有报错</span>}
                   {!row.hasError && row.hasPartial && <span className="tag warn">回复不完整</span>}
                 </span>
-              </button>
+              </Link>
             </li>
           ))}
         </ul>
@@ -212,12 +218,15 @@ const completenessLabel = { complete: '完整', partial: '回复不完整', erro
 export function RequestList({ search, go }: { search: AppSearch; go: Navigate }) {
   const query = useInfiniteQuery(requestsQuery(search));
   const rows = query.data?.pages.flatMap((page) => page.rows) ?? [];
+  const target = (row: (typeof rows)[number]) =>
+    validateAppSearch(
+      row.conversationId !== null
+        ? { ...search, c: row.conversationId, t: row.turnIndex ?? undefined, r: row.recordId }
+        : { ...search, c: undefined, t: undefined, r: row.recordId },
+    );
   const open = (recordId: number) => {
     const row = rows.find((candidate) => candidate.recordId === recordId);
-    if (!row) return;
-    if (row.conversationId !== null)
-      go({ ...search, c: row.conversationId, t: row.turnIndex ?? undefined, r: recordId });
-    else go({ ...search, c: undefined, t: undefined, r: recordId });
+    if (row) go(target(row));
   };
   const sentinel = useAutoLoad(query);
   useRowKeys(
@@ -240,11 +249,12 @@ export function RequestList({ search, go }: { search: AppSearch; go: Navigate })
         <ul className="rows">
           {rows.map((row) => (
             <li key={row.recordId}>
-              <button
-                type="button"
+              <Link
+                to="/"
+                activeOptions={{ exact: true }}
+                search={target(row)}
                 className="row request-row"
                 aria-current={search.r === row.recordId ? 'true' : undefined}
-                onClick={() => open(row.recordId)}
               >
                 <span className="row-title mono" title={row.requestId}>
                   {shortId(row.requestId || '无请求编号', 8)}
@@ -263,7 +273,7 @@ export function RequestList({ search, go }: { search: AppSearch; go: Navigate })
                   </span>
                   {row.conversationId === null && <span className="tag quiet">不属于会话</span>}
                 </span>
-              </button>
+              </Link>
             </li>
           ))}
         </ul>

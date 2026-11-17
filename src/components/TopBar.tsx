@@ -1,9 +1,11 @@
 import { useQuery } from '@tanstack/react-query';
+import { Link } from '@tanstack/react-router';
 import { useEffect, useRef, useState } from 'react';
 import brandMark from '../assets/brand/contextledger-mark-128.png';
 import { bytes, dateTime } from '../client/format';
 import { lookupQuery, metricsQuery, uploadsQuery } from '../client/queries';
 import type { AppSearch } from '../client/search';
+import { modalOpen } from '../client/shortcuts';
 import type { LookupCandidate } from '../conversation-contracts';
 import { Icon } from './Icon';
 
@@ -23,7 +25,7 @@ function SearchBox({ search, go }: { search: AppSearch; go: Navigate }) {
   const lookup = useQuery({ ...lookupQuery(submitted), enabled: submitted.length > 0 });
   useEffect(() => {
     const onKey = (event: KeyboardEvent) => {
-      if (event.key === '/' && !event.isComposing && !isTyping(event.target)) {
+      if (event.key === '/' && !event.isComposing && !isTyping(event.target) && !modalOpen()) {
         event.preventDefault();
         input.current?.focus();
       }
@@ -180,10 +182,16 @@ export function TopBar({
   const stats = metrics.data;
   return (
     <header className="topbar">
-      <a className="brand" href="/" aria-label="ContextLedger 首页">
+      <Link
+        to="/"
+        activeOptions={{ exact: true }}
+        search={{}}
+        className="brand"
+        aria-label="ContextLedger 首页"
+      >
         <img src={brandMark} alt="" width={28} height={28} />
         <span>ContextLedger</span>
-      </a>
+      </Link>
       <fieldset className="tabs">
         <legend className="sr-only">列表</legend>
         <button

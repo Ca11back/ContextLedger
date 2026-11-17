@@ -1,5 +1,5 @@
 import { useQuery, useQueryClient } from '@tanstack/react-query';
-import { useEffect, useRef, useState } from 'react';
+import { type PointerEvent, useEffect, useId, useRef, useState } from 'react';
 import { recordViewQuery } from '../client/queries';
 import type { RecordView } from '../view-contracts';
 import { ErrorState } from './Feedback';
@@ -133,6 +133,24 @@ export function RawBrowser({ recordId }: { recordId: number }) {
   );
 }
 
+/** Click-outside closing for browsers without `closedby` (pointer position, not event target). */
+function outside(event: PointerEvent<HTMLDialogElement>) {
+  const box = event.currentTarget.getBoundingClientRect();
+  return (
+    event.clientX < box.left ||
+    event.clientX > box.right ||
+    event.clientY < box.top ||
+    event.clientY > box.bottom
+  );
+}
+
+const lightDismissFallback = () =>
+  typeof HTMLDialogElement !== 'undefined' && !('closedBy' in HTMLDialogElement.prototype);
+
+/**
+ * Native modal dialog styled as a right-side drawer. `showModal()` provides the inert page,
+ * focus containment, Esc and focus return; `closedby="any"` adds click-outside closing.
+ */
 export function RawDrawer({
   recordId,
   title,
@@ -142,41 +160,44 @@ export function RawDrawer({
   title: string;
   close: () => void;
 }) {
-  const panel = useRef<HTMLDivElement>(null);
+  const dialog = useRef<HTMLDialogElement>(null);
+  const pressedOutside = useRef(false);
+  const titleId = useId();
   useEffect(() => {
-    const returnTo = document.activeElement as HTMLElement | null;
-    panel.current?.focus();
-    const onKey = (event: KeyboardEvent) => {
-      if (event.key === 'Escape') close();
-    };
-    window.addEventListener('keydown', onKey);
-    return () => {
-      window.removeEventListener('keydown', onKey);
-      returnTo?.focus();
-    };
-  }, [close]);
+    const node = dialog.current;
+    if (node && !node.open) node.showModal();
+  }, []);
   return (
-    <div className="drawer-backdrop">
-      <button type="button" className="drawer-scrim" aria-label="关闭原始数据" onClick={close} />
-      <div
-        className="drawer"
-        role="dialog"
-        aria-modal="true"
-        aria-label={title}
-        tabIndex={-1}
-        ref={panel}
-      >
-        <header className="drawer-head">
-          <h2>{title}</h2>
-          <button type="button" className="icon-button" aria-label="关闭原始数据" onClick={close}>
-            <Icon name="close" size={18} />
-          </button>
-        </header>
-        <p className="muted small">
-          这是收到并校验过的原始上报内容，按层级分页查看。文字均按纯文本显示，不加载任何外部资源。
-        </p>
-        <RawBrowser recordId={recordId} />
-      </div>
-    </div>
+    <dialog
+      ref={dialog}
+      className="drawer"
+      aria-labelledby={titleId}
+      onClose={close}
+      onPointerDown={(event) => {
+        pressedOutside.current = lightDismissFallback() && outside(event);
+      }}
+      onPointerUp={(event) => {
+        if (pressedOutside.current && outside(event)) event.currentTarget.close();
+        pressedOutside.current = false;
+      }}
+      // `closedby` is not in React's DOM types yet; React passes it through as an attribute.
+      {...({ closedby: 'any' } as Record<string, string>)}
+    >
+      <header className="drawer-head">
+        <h2 id={titleId}>{title}</h2>
+        <button
+          type="button"
+          className="icon-button"
+          aria-label="关闭原始数据"
+          onClick={() => dialog.current?.close()}
+        >
+          <Icon name="close" size={18} />
+        </button>
+      </header>
+      <p className="muted small">
+        这是收到并校验过的原始上报内容，按层级分页查看。文字均按纯文本显示，不加载任何外部资源。
+      </p>
+      <RawBrowser recordId={recordId} />
+    </dialog>
   );
 }

@@ -1,9 +1,11 @@
 import { useInfiniteQuery, useQuery } from '@tanstack/react-query';
+import { Link } from '@tanstack/react-router';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { charge, clock, count, dateTime, duration, shortId, tokens } from '../client/format';
 import { conversationQuery, fragmentsQuery, recordViewQuery } from '../client/queries';
-import type { AppSearch } from '../client/search';
+import { type AppSearch, validateAppSearch } from '../client/search';
 import { useSentinel } from '../client/sentinel';
+import { modalOpen } from '../client/shortcuts';
 import { buildTranscript, type TurnView } from '../client/transcript';
 import type { ConversationDetail } from '../conversation-contracts';
 import { EmptyState, ErrorState, Loading } from './Feedback';
@@ -11,7 +13,10 @@ import { Icon } from './Icon';
 import { LeadingHistory, MessageList } from './Message';
 import { RawBrowser, RawDrawer } from './RawDrawer';
 
-type Navigate = (next: AppSearch) => void;
+/** Search state for opening conversation `c` (optionally at turn `t`) from the current view. */
+function openAt(search: AppSearch, c: number, t?: number): AppSearch {
+  return validateAppSearch({ ...search, c, t, r: undefined });
+}
 
 const resetText = {
   window_changed: '上下文在这里发生了变化（客户端换了上下文窗口，常见于压缩）',
@@ -40,7 +45,6 @@ export function TurnBlock({
   anchored,
   openRaw,
   spurs,
-  go,
   search,
   streamOpen = false,
 }: {
@@ -48,7 +52,6 @@ export function TurnBlock({
   anchored: boolean;
   openRaw: (recordId: number, title: string) => void;
   spurs: { id: number; title: string }[];
-  go: Navigate;
   search: AppSearch;
   /** The fragments stream may still continue this turn (last turn received, more pages). */
   streamOpen?: boolean;
@@ -119,7 +122,7 @@ export function TurnBlock({
                 type="button"
                 className="link small"
                 aria-expanded={expanded}
-                aria-controls={`turn-${turn.turnIndex}-content`}
+                aria-controls={expanded ? `turn-${turn.turnIndex}-content` : undefined}
                 onClick={() => setToggled(!expanded)}
               >
                 {expanded ? '收起' : '展开'}
@@ -181,13 +184,14 @@ export function TurnBlock({
           </div>
           <p>
             此处分出{' '}
-            <button
-              type="button"
+            <Link
+              to="/"
+              activeOptions={{ exact: true }}
+              search={openAt(search, spur.id)}
               className="link"
-              onClick={() => go({ ...search, c: spur.id, t: undefined, r: undefined })}
             >
               会话 #{spur.id}「{spur.title || '无标题'}」
-            </button>
+            </Link>
           </p>
         </div>
       ))}
@@ -197,12 +201,10 @@ export function TurnBlock({
 
 function InheritedTurns({
   detail,
-  go,
   search,
   openRaw,
 }: {
   detail: ConversationDetail;
-  go: Navigate;
   search: AppSearch;
   openRaw: (recordId: number, title: string) => void;
 }) {
@@ -226,23 +228,18 @@ function InheritedTurns({
           <button type="button" className="link small" onClick={() => setOpen(!open)}>
             {open ? '收起' : `展开前 ${source.turn} 轮`}
           </button>
-          <button
-            type="button"
+          <Link
+            to="/"
+            activeOptions={{ exact: true }}
+            search={openAt(search, source.id, source.turn)}
             className="link small"
-            onClick={() => go({ ...search, c: source.id, t: source.turn, r: undefined })}
           >
             打开会话 #{source.id}
-          </button>
+          </Link>
         </span>
       </div>
       {open && (
-        <InheritedBody
-          id={source.id}
-          until={source.turn}
-          openRaw={openRaw}
-          go={go}
-          search={search}
-        />
+        <InheritedBody id={source.id} until={source.turn} openRaw={openRaw} search={search} />
       )}
     </div>
   );
@@ -252,13 +249,11 @@ function InheritedBody({
   id,
   until,
   openRaw,
-  go,
   search,
 }: {
   id: number;
   until: number;
   openRaw: (recordId: number, title: string) => void;
-  go: Navigate;
   search: AppSearch;
 }) {
   const { query, turns, lastSeen } = useFragments(id, undefined, until);
@@ -280,7 +275,6 @@ function InheritedBody({
           anchored={false}
           openRaw={openRaw}
           spurs={[]}
-          go={go}
           search={search}
           streamOpen={more && index === turns.length - 1}
         />
@@ -294,26 +288,18 @@ function InheritedBody({
   );
 }
 
-function Header({
-  detail,
-  go,
-  search,
-}: {
-  detail: ConversationDetail;
-  go: Navigate;
-  search: AppSearch;
-}) {
+function Header({ detail, search }: { detail: ConversationDetail; search: AppSearch }) {
   const c = detail.conversation;
-  const open = (id: number) => go({ ...search, c: id, t: undefined, r: undefined });
   return (
     <section className="reader-head">
-      <button
-        type="button"
+      <Link
+        to="/"
+        activeOptions={{ exact: true }}
+        search={validateAppSearch({ ...search, c: undefined, t: undefined, r: undefined })}
         className="link back"
-        onClick={() => go({ ...search, c: undefined, t: undefined, r: undefined })}
       >
         <Icon name="left" size={14} /> {search.tab === 'requests' ? '请求列表' : '会话列表'}
-      </button>
+      </Link>
       <h1>{c.title || '（无标题）'}</h1>
       <p className="facts">
         <span>
@@ -347,9 +333,14 @@ function Header({
             ) : (
               <>
                 由{' '}
-                <button type="button" className="link" onClick={() => open(detail.subagentOf!.id)}>
+                <Link
+                  to="/"
+                  activeOptions={{ exact: true }}
+                  search={openAt(search, detail.subagentOf.id)}
+                  className="link"
+                >
                   会话 #{detail.subagentOf.id}「{detail.subagentOf.title ?? '无标题'}」
-                </button>{' '}
+                </Link>{' '}
                 启动
               </>
             )}
@@ -362,9 +353,14 @@ function Header({
           <Icon name="fork" />
           <span>
             从{' '}
-            <button type="button" className="link" onClick={() => open(detail.forkedFrom!.id)}>
+            <Link
+              to="/"
+              activeOptions={{ exact: true }}
+              search={openAt(search, detail.forkedFrom.id)}
+              className="link"
+            >
               会话 #{detail.forkedFrom.id}「{detail.forkedFrom.title ?? '无标题'}」
-            </button>{' '}
+            </Link>{' '}
             第 {detail.forkedFrom.turn} 轮分出。
           </span>
         </p>
@@ -375,9 +371,14 @@ function Header({
           {detail.subagentsPreview.map((agent, index) => (
             <span key={agent.id}>
               {index > 0 && '、'}
-              <button type="button" className="link" onClick={() => open(agent.id)}>
+              <Link
+                to="/"
+                activeOptions={{ exact: true }}
+                search={openAt(search, agent.id)}
+                className="link"
+              >
                 {agent.agentName ?? `会话 #${agent.id}`}
-              </button>
+              </Link>
             </span>
           ))}
           {detail.subagentCount > detail.subagentsPreview.length && ' 等'}
@@ -387,15 +388,7 @@ function Header({
   );
 }
 
-export function ConversationReader({
-  id,
-  search,
-  go,
-}: {
-  id: number;
-  search: AppSearch;
-  go: Navigate;
-}) {
+export function ConversationReader({ id, search }: { id: number; search: AppSearch }) {
   const detail = useQuery(conversationQuery(id));
   const [start, setStart] = useState<number | undefined>(search.t);
   useEffect(() => setStart(search.t), [search.t]);
@@ -417,6 +410,7 @@ export function ConversationReader({
     const onKey = (event: KeyboardEvent) => {
       if (event.isComposing || event.metaKey || event.ctrlKey || event.altKey) return;
       if (event.key !== '[' && event.key !== ']') return;
+      if (modalOpen()) return;
       const target = event.target as HTMLElement | null;
       if (
         target &&
@@ -445,10 +439,10 @@ export function ConversationReader({
   const first = turns[0]?.turn.turnIndex;
   return (
     <>
-      <Header detail={detail.data} go={go} search={search} />
+      <Header detail={detail.data} search={search} />
       <div className="thread">
         {(!first || first === 1) && (
-          <InheritedTurns detail={detail.data} go={go} search={search} openRaw={openRaw} />
+          <InheritedTurns detail={detail.data} search={search} openRaw={openRaw} />
         )}
         {first !== undefined && first > 1 && (
           <button
@@ -473,7 +467,6 @@ export function ConversationReader({
               anchored={search.t === view.turn.turnIndex}
               openRaw={openRaw}
               spurs={spursAt.get(view.turn.turnIndex) ?? []}
-              go={go}
               search={search}
               streamOpen={hasNextPage && index === turns.length - 1}
             />
@@ -494,23 +487,20 @@ export function ConversationReader({
   );
 }
 
-export function RequestReader({
-  recordId,
-  search,
-  go,
-}: {
-  recordId: number;
-  search: AppSearch;
-  go: Navigate;
-}) {
+export function RequestReader({ recordId, search }: { recordId: number; search: AppSearch }) {
   const root = useQuery(recordViewQuery(recordId, [], 0));
   const meta = root.data?.meta;
   return (
     <>
       <section className="reader-head">
-        <button type="button" className="link back" onClick={() => go({ ...search, r: undefined })}>
+        <Link
+          to="/"
+          activeOptions={{ exact: true }}
+          search={validateAppSearch({ ...search, r: undefined })}
+          className="link back"
+        >
           <Icon name="left" size={14} /> 请求列表
-        </button>
+        </Link>
         <h1>{meta ? meta.model || '未知模型' : '单条请求'}</h1>
         {meta && (
           <p className="facts">

@@ -335,13 +335,15 @@ fieldset {
   display: block;
   width: 100%;
   text-align: left;
+  color: inherit;
+  text-decoration: none;
   padding: 12px 16px;
   border-bottom: 1px solid var(--rule);
 }
 .row:hover {
   background: var(--paper);
 }
-.row[aria-current="true"] {
+.row[aria-current] {
   background: var(--paper);
   box-shadow: inset 3px 0 0 var(--ink);
 }
@@ -508,6 +510,18 @@ fieldset {
   display: grid;
   grid-template-columns: 44px minmax(0, 1fr);
 }
+/* Long transcripts: skip layout and paint of off-screen turns. `auto` remembers the rendered
+   height, so scrolling back does not jump; the anchored turn always renders for scrollIntoView. */
+.turn {
+  content-visibility: auto;
+  contain-intrinsic-size: auto none auto 400px;
+}
+.turn.collapsed {
+  contain-intrinsic-size: auto none auto 56px;
+}
+.turn.anchored {
+  content-visibility: visible;
+}
 .rail {
   position: relative;
 }
@@ -662,32 +676,33 @@ fieldset {
   color: var(--muted);
 }
 
-/* Raw drawer */
-.drawer-backdrop {
-  position: fixed;
-  inset: 0;
-  z-index: 50;
-  background: #181c3333;
-  display: flex;
-  justify-content: flex-end;
-}
-.drawer-scrim {
-  position: absolute;
-  inset: 0;
-  cursor: default;
-}
-.drawer {
-  position: relative;
+/* Raw drawer: a native modal <dialog> pinned to the right edge. */
+dialog.drawer {
+  inset: 0 0 0 auto;
+  margin: 0;
   width: min(640px, 100%);
+  max-width: 100%;
   height: 100%;
+  max-height: 100%;
   overflow: auto;
+  border: 0;
   background: var(--sheet);
+  color: inherit;
   padding: 18px 22px;
+  box-shadow: -10px 0 30px #181c3324;
+}
+dialog.drawer[open] {
   display: grid;
   align-content: start;
   gap: 12px;
-  box-shadow: -10px 0 30px #181c3324;
-  outline: none;
+}
+dialog.drawer:modal {
+  overscroll-behavior: contain;
+}
+dialog.drawer::backdrop {
+  background: #181c3333;
+  overflow: hidden;
+  overscroll-behavior: contain;
 }
 .drawer-head {
   display: flex;

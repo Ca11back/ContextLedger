@@ -1,6 +1,7 @@
 import { expect, test } from 'bun:test';
 import { createDashboardQueryClient } from '../src/client/queries';
 import {
+  appSearchSchema,
   conversationFilterKeys,
   listParams,
   requestFilterKeys,
@@ -37,6 +38,31 @@ test('URL state keeps conversation, turn and filters and rejects unsafe values',
   expect(validateAppSearch({ c: '0', status: 'weird', kind: 'x' })).toEqual({});
   expect(validateAppSearch({ from: '20', to: '10' })).toEqual({});
   expect(validateAppSearch({ user: 'a'.repeat(257) })).toEqual({});
+});
+
+test('URL search schema applies each field fallback on its own', () => {
+  // Numbers arrive as numbers from the router's JSON-aware search parser, or as strings.
+  expect(validateAppSearch({ c: 5, t: 2, r: 9 })).toEqual({ c: 5, t: 2, r: 9 });
+  expect(validateAppSearch({ c: 123456789012345 })).toEqual({ c: 123456789012345 });
+  for (const bad of ['1234567890123456', '-1', '1.5', 1.5, -3, '0x10', ' 7', '', null, true, {}])
+    expect(validateAppSearch({ c: bad })).toEqual({});
+  // One bad field never discards the others.
+  expect(validateAppSearch({ c: 'x', r: '4', user: 7, token: 't', tab: 'other' })).toEqual({
+    r: 4,
+    token: 't',
+  });
+  expect(validateAppSearch({ user: '', model: 'a'.repeat(256) })).toEqual({
+    model: 'a'.repeat(256),
+  });
+  // Equal bounds and a single bound are kept; only an inverted range is dropped.
+  expect(validateAppSearch({ from: '10', to: '10' })).toEqual({ from: 10, to: 10 });
+  expect(validateAppSearch({ from: '20' })).toEqual({ from: 20 });
+  expect(validateAppSearch({ c: 'bad', t: '3' })).toEqual({});
+  // Unknown keys are dropped and undefined values never reach the URL.
+  const parsed = validateAppSearch({ c: '1', t: undefined, cursor: 'x' });
+  expect(Object.keys(parsed)).toEqual(['c']);
+  // The schema itself is what the route validates with, so it never throws.
+  expect(appSearchSchema.safeParse({ status: 1, kind: [] }).success).toBe(true);
 });
 
 test('list parameters carry only the filters each list supports', () => {
