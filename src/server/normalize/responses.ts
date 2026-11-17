@@ -10,6 +10,7 @@ import {
   mediaDisplay,
   message,
   roleKind,
+  sourceUserText,
   string,
 } from './common';
 import type { NormalizedMessage } from './types';
@@ -31,7 +32,11 @@ export function responseItem(value: unknown, completed = true): NormalizedMessag
         content: contentProjection(item.content),
       },
       contentValues(item.content),
-      { ...fields, media: contentMedia(item.content) },
+      {
+        ...fields,
+        media: contentMedia(item.content),
+        userText: role === 'user' ? sourceUserText(item.content) : '',
+      },
       completed,
     );
     normalized.evidence &&= knownAssistantContent(item.content);

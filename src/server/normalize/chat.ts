@@ -9,6 +9,7 @@ import {
   knownAssistantContent,
   message,
   roleKind,
+  sourceUserText,
   string,
 } from './common';
 import type { NormalizedMessage } from './types';
@@ -33,7 +34,13 @@ function chatMessage(value: unknown, completed = true): NormalizedMessage[] {
           content: contentProjection(item.content),
         },
         contentValues(item.content),
-        { role, name: item.name, callId: item.tool_call_id, media: contentMedia(item.content) },
+        {
+          role,
+          name: item.name,
+          callId: item.tool_call_id,
+          media: contentMedia(item.content),
+          userText: role === 'user' ? sourceUserText(item.content) : '',
+        },
         completed,
       ),
     );

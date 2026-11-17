@@ -12,6 +12,13 @@ export const requestIndexColumns = {
   input_count: 'INTEGER NOT NULL DEFAULT 0',
   evidence_count: 'INTEGER NOT NULL DEFAULT 0',
   input_chain: 'TEXT',
+  retry_input_chain: 'TEXT',
+  previous_response_id: 'TEXT',
+  retry_of: 'INTEGER',
+  retry_of_turn: 'INTEGER',
+  superseded: 'INTEGER NOT NULL DEFAULT 0',
+  continuation_eligible: 'INTEGER NOT NULL DEFAULT 0',
+  last_user_text: "TEXT NOT NULL DEFAULT ''",
   evidence_chain: 'TEXT',
   response_id: 'TEXT',
   parent_id: 'INTEGER',
@@ -31,7 +38,7 @@ export const requestIndexColumns = {
   stop_reason: 'TEXT',
 } as const;
 export const conversationSchema = `
-CREATE TABLE conversations (
+CREATE TABLE IF NOT EXISTS conversations (
  id INTEGER PRIMARY KEY AUTOINCREMENT, source TEXT NOT NULL, user_id TEXT, token_id TEXT, protocol TEXT NOT NULL,
  title TEXT NOT NULL, first_at INTEGER NOT NULL, last_at INTEGER NOT NULL,
  own_turns INTEGER NOT NULL DEFAULT 0, inherited_turns INTEGER NOT NULL DEFAULT 0,
@@ -41,31 +48,36 @@ CREATE TABLE conversations (
  forked_from_conversation INTEGER, forked_from_turn INTEGER, branch_count INTEGER NOT NULL DEFAULT 0, thread_key TEXT,
  next_turn INTEGER NOT NULL DEFAULT 1, unknown_charge INTEGER NOT NULL DEFAULT 0,
  error_turns INTEGER NOT NULL DEFAULT 0, partial_turns INTEGER NOT NULL DEFAULT 0, known_charge REAL NOT NULL DEFAULT 0);
-CREATE INDEX conversations_activity ON conversations(last_at,id);
-CREATE INDEX conversations_fork ON conversations(forked_from_conversation,id);
-CREATE INDEX conversations_thread ON conversations(thread_key,id);
-CREATE TABLE threads (
+CREATE INDEX IF NOT EXISTS conversations_activity ON conversations(last_at,id);
+CREATE INDEX IF NOT EXISTS conversations_fork ON conversations(forked_from_conversation,id);
+CREATE INDEX IF NOT EXISTS conversations_thread ON conversations(thread_key,id);
+CREATE TABLE IF NOT EXISTS threads (
  thread_key TEXT PRIMARY KEY, source TEXT NOT NULL, user_id TEXT NOT NULL, token_id TEXT NOT NULL, protocol TEXT NOT NULL,
  session_key TEXT, primary_conversation_id INTEGER NOT NULL, primary_next_turn INTEGER NOT NULL DEFAULT 1, parent_thread_key TEXT, subagent_of INTEGER,
  agent_name TEXT, subagent_kind TEXT, subagent_count INTEGER NOT NULL DEFAULT 0, conflict INTEGER NOT NULL DEFAULT 0);
-CREATE INDEX threads_primary ON threads(primary_conversation_id);
-CREATE INDEX threads_session ON threads(session_key);
-CREATE INDEX threads_parent ON threads(parent_thread_key);
-CREATE INDEX threads_subagent ON threads(subagent_of,thread_key);
-CREATE TABLE conversation_models(conversation_id INTEGER NOT NULL, model TEXT NOT NULL, turns INTEGER NOT NULL,
+CREATE INDEX IF NOT EXISTS threads_primary ON threads(primary_conversation_id);
+CREATE INDEX IF NOT EXISTS threads_session ON threads(session_key);
+CREATE INDEX IF NOT EXISTS threads_parent ON threads(parent_thread_key);
+CREATE INDEX IF NOT EXISTS threads_subagent ON threads(subagent_of,thread_key);
+CREATE TABLE IF NOT EXISTS conversation_models(conversation_id INTEGER NOT NULL, model TEXT NOT NULL, turns INTEGER NOT NULL,
  PRIMARY KEY(conversation_id,model));
-CREATE INDEX requests_evidence ON requests(source,user_id,token_id,protocol,evidence_chain);
-CREATE INDEX requests_response ON requests(source,user_id,token_id,protocol,response_id);
-CREATE INDEX requests_thread ON requests(thread_key);
-CREATE INDEX requests_session ON requests(session_key);
-CREATE INDEX requests_parent_thread ON requests(parent_thread_key);
-CREATE INDEX requests_conversation ON requests(conversation_id,turn_index);
-CREATE INDEX requests_conversation_time ON requests(conversation_id,received_at,id);
-CREATE INDEX requests_parent ON requests(parent_id);
+CREATE INDEX IF NOT EXISTS requests_evidence ON requests(source,user_id,token_id,protocol,evidence_chain);
+CREATE INDEX IF NOT EXISTS requests_response ON requests(source,user_id,token_id,protocol,response_id);
+CREATE INDEX IF NOT EXISTS requests_thread ON requests(thread_key);
+CREATE INDEX IF NOT EXISTS requests_session ON requests(session_key);
+CREATE INDEX IF NOT EXISTS requests_parent_thread ON requests(parent_thread_key);
+CREATE INDEX IF NOT EXISTS requests_conversation ON requests(conversation_id,turn_index);
+CREATE INDEX IF NOT EXISTS requests_conversation_time ON requests(conversation_id,received_at,id);
+CREATE INDEX IF NOT EXISTS requests_parent ON requests(parent_id);
+CREATE INDEX IF NOT EXISTS requests_parent_eligible ON requests(parent_id,continuation_eligible);
+CREATE INDEX IF NOT EXISTS requests_retry ON requests(source,user_id,token_id,protocol,parent_id,thread_key,retry_input_chain,previous_response_id,received_at,id);
 `;
 export function installConversationSchema(db: Database) {
+  const existing = new Set(
+    (db.query('PRAGMA table_info(requests)').all() as { name: string }[]).map((c) => c.name),
+  );
   for (const [column, definition] of Object.entries(requestIndexColumns))
-    db.exec(`ALTER TABLE requests ADD COLUMN ${column} ${definition}`);
+    if (!existing.has(column)) db.exec(`ALTER TABLE requests ADD COLUMN ${column} ${definition}`);
   db.exec(conversationSchema);
 }
 interface Parent {
@@ -80,6 +92,15 @@ interface Parent {
   response_id: string | null;
   conversation_id: number;
   turn_index: number;
+  thread_key: string | null;
+}
+interface Retry {
+  id: number;
+  conversation_id: number;
+  turn_index: number;
+  parent_id: number | null;
+  retry_input_chain: string;
+  previous_response_id: string | null;
   thread_key: string | null;
 }
 interface Thread {
@@ -108,6 +129,8 @@ export interface IndexMeta {
 export interface PreparedIndex {
   normalized: NormalizedRequest;
   parent: Parent | null;
+  retry: Retry | null;
+  continuationEligible: boolean;
   title: string;
   inputTokens: number | null;
   outputTokens: number | null;
@@ -156,18 +179,46 @@ export class ConversationIndex {
         if (tied) parent = null;
       }
     }
-    const start = parent && !n.previousResponseId ? parent.evidence_count : n.leadingHistoryCount;
-    const title =
-      n.input
-        .slice(start)
-        .find((m) => m.kind === 'user')
-        ?.parts.find((p) => p.kind === 'text')
-        ?.text.slice(0, 120) ?? n.title;
+    let retry: Retry | null = null;
+    // Unanchored undeclared roots must never merge solely on a common prompt.
+    if (n.chat && n.domain && (parent || n.identity || n.previousResponseId)) {
+      retry = this.db
+        .query<
+          Retry,
+          SQLQueryBindings[]
+        >(`SELECT id,conversation_id,turn_index,parent_id,retry_input_chain,previous_response_id,thread_key FROM requests
+        WHERE source=? AND user_id=? AND token_id=? AND protocol=? AND parent_id IS ? AND thread_key IS ?
+        AND retry_input_chain=? AND previous_response_id IS ? AND conversation_id IS NOT NULL
+        ORDER BY received_at DESC,id DESC LIMIT 1`)
+        .get(
+          meta.source,
+          n.userId,
+          n.tokenId,
+          n.protocol,
+          parent?.id ?? null,
+          n.identity?.threadKey ?? null,
+          n.retryInputChain,
+          n.previousResponseId,
+        );
+    }
+    const start = n.previousResponseId ? 0 : parent ? parent.evidence_count : n.leadingHistoryCount;
+    const title = n.input.slice(start).find((m) => m.userText)?.userText || n.lastUserText;
     const usage = object(JSON.parse(meta.usage_json)),
       cost = object(JSON.parse(meta.cost_json));
     return {
       normalized: n,
       parent,
+      retry,
+      continuationEligible: n.previousResponseId
+        ? n.completeness !== 'error' &&
+          n.output.some(
+            (m) =>
+              m.completed &&
+              m.evidence &&
+              (m.kind === 'assistant' || m.kind === 'tool_call') &&
+              m.parts.some((p) => p.text.length > 0),
+          )
+        : n.evidenceChain !== null,
       title: title.slice(0, 120),
       inputTokens: numeric(usage.promptTokens),
       outputTokens: numeric(usage.completionTokens),
@@ -197,6 +248,36 @@ export class ConversationIndex {
         parent = null;
       else parent = live;
     }
+    let retry = prepared.retry;
+    if (retry) {
+      const live = this.db
+        .query<
+          Retry & {
+            source: string;
+            user_id: string | null;
+            token_id: string | null;
+            protocol: string;
+          },
+          [number]
+        >(
+          'SELECT id,source,user_id,token_id,protocol,conversation_id,turn_index,parent_id,retry_input_chain,previous_response_id,thread_key FROM requests WHERE id=?',
+        )
+        .get(retry.id);
+      if (
+        !live ||
+        live.source !== meta.source ||
+        live.user_id !== n.userId ||
+        live.token_id !== n.tokenId ||
+        live.protocol !== n.protocol ||
+        live.parent_id !== (parent?.id ?? null) ||
+        live.thread_key !== (n.identity?.threadKey ?? null) ||
+        live.retry_input_chain !== n.retryInputChain ||
+        live.previous_response_id !== n.previousResponseId ||
+        (!parent && !n.identity && !n.previousResponseId)
+      )
+        retry = null;
+      else retry = live;
+    }
     let conversation: Conversation | null = null;
     let reset: string | null = null;
     let thread = n.identity
@@ -205,16 +286,22 @@ export class ConversationIndex {
           .get(n.identity.threadKey)
       : null;
     if (n.chat) {
-      if (parent) {
+      if (retry) {
+        conversation = this.db
+          .query<Conversation, [number]>('SELECT * FROM conversations WHERE id=?')
+          .get(retry.conversation_id);
+        if (!conversation) retry = null;
+      }
+      if (!conversation && parent) {
         const branching = !!this.db
-          .query('SELECT 1 FROM requests WHERE parent_id=? LIMIT 1')
+          .query('SELECT 1 FROM requests WHERE parent_id=? AND continuation_eligible=1 LIMIT 1')
           .get(parent.id);
         if (!branching)
           conversation = this.db
             .query<Conversation, [number]>('SELECT * FROM conversations WHERE id=?')
             .get(parent.conversation_id);
         if (!conversation) conversation = this.createConversation(meta, prepared, parent);
-      } else if (thread) {
+      } else if (!conversation && thread) {
         conversation = this.db
           .query<Conversation, [number]>('SELECT * FROM conversations WHERE id=?')
           .get(thread.primary_conversation_id);
@@ -292,6 +379,13 @@ export class ConversationIndex {
       input_count: n.inputCount,
       evidence_count: n.evidenceCount,
       input_chain: n.inputChain,
+      retry_input_chain: n.retryInputChain,
+      previous_response_id: n.previousResponseId,
+      retry_of: retry?.id ?? null,
+      retry_of_turn: retry?.turn_index ?? null,
+      superseded: 0,
+      continuation_eligible: prepared.continuationEligible ? 1 : 0,
+      last_user_text: n.lastUserText,
       evidence_chain: n.evidenceChain,
       response_id: n.responseId,
       parent_id: parent?.id ?? null,
@@ -318,6 +412,13 @@ export class ConversationIndex {
       )
       .run(...Object.values(values), id);
     if (conversation) {
+      if (retry)
+        this.db
+          .query('UPDATE requests SET superseded=1 WHERE id=? AND conversation_id=?')
+          .run(retry.id, conversation.id);
+      this.db
+        .query("UPDATE conversations SET title=? WHERE id=? AND title=''")
+        .run(prepared.title, conversation.id);
       this.db
         .query(`UPDATE conversations SET own_turns=own_turns+1,next_turn=next_turn+1,first_at=min(first_at,?),last_at=max(last_at,?),
         input_tokens=input_tokens+?,output_tokens=output_tokens+?,known_charge=known_charge+?,unknown_charge=unknown_charge+?,
@@ -365,7 +466,7 @@ export class ConversationIndex {
         p.normalized.userId,
         p.normalized.tokenId,
         p.normalized.protocol,
-        parent ? p.title : p.normalized.title,
+        parent || p.normalized.previousResponseId ? p.title : p.normalized.title,
         meta.received_at,
         meta.received_at,
         inherited,
@@ -435,7 +536,7 @@ export class ConversationIndex {
       .query('UPDATE threads SET subagent_count=subagent_count+1 WHERE thread_key=?')
       .run(parent.thread_key);
   }
-  private refreshFlags(id: number) {
+  private refreshFlags(id: number, excludedId = -1) {
     const models = this.db
       .query<{ model: string }, [number]>(
         'SELECT model FROM conversation_models WHERE conversation_id=? ORDER BY model LIMIT 5',
@@ -448,8 +549,18 @@ export class ConversationIndex {
       .get(id)!.n;
     this.db
       .query(`UPDATE conversations SET models=?,more_models=?,charge_quota=CASE WHEN unknown_charge=0 THEN known_charge ELSE NULL END,
-      charge_partial=unknown_charge>0,has_error=error_turns>0,has_partial=partial_turns>0 WHERE id=?`)
-      .run(JSON.stringify(models.slice(0, 4).map((m) => m.model)), Math.max(0, count - 4), id);
+      charge_partial=unknown_charge>0,
+      has_error=coalesce((SELECT completeness='error' FROM requests WHERE conversation_id=? AND id!=? ORDER BY turn_index DESC LIMIT 1),0),
+      has_partial=coalesce((SELECT completeness='partial' FROM requests WHERE conversation_id=? AND id!=? ORDER BY turn_index DESC LIMIT 1),0) WHERE id=?`)
+      .run(
+        JSON.stringify(models.slice(0, 4).map((m) => m.model)),
+        Math.max(0, count - 4),
+        id,
+        excludedId,
+        id,
+        excludedId,
+        id,
+      );
   }
   private pruneThread(key: string | null) {
     const visited = new Set<string>();
@@ -498,12 +609,21 @@ export class ConversationIndex {
           output_tokens: number | null;
           charge_quota: number | null;
           completeness: string;
+          parent_id: number | null;
+          retry_input_chain: string | null;
+          previous_response_id: string | null;
         },
         [number]
       >('SELECT * FROM requests WHERE id=?')
       .get(id);
     if (!row?.conversation_id) return;
     const cid = row.conversation_id;
+    // The root is still present here. Explicitly exclude it from end-state/supersession queries.
+    this.db
+      .query(`UPDATE requests SET superseded=0 WHERE id=(SELECT id FROM requests
+      WHERE conversation_id=? AND parent_id IS ? AND retry_input_chain IS ? AND previous_response_id IS ? AND thread_key IS ? AND id!=?
+      ORDER BY turn_index DESC LIMIT 1)`)
+      .run(cid, row.parent_id, row.retry_input_chain, row.previous_response_id, row.thread_key, id);
     this.db
       .query(
         `UPDATE conversations SET own_turns=own_turns-1,input_tokens=input_tokens-?,output_tokens=output_tokens-?,known_charge=known_charge-?,unknown_charge=unknown_charge-?,error_turns=error_turns-?,partial_turns=partial_turns-? WHERE id=?`,
@@ -539,7 +659,7 @@ export class ConversationIndex {
           'UPDATE conversations SET first_at=(SELECT min(received_at) FROM requests WHERE conversation_id=? AND id!=?),last_at=(SELECT max(received_at) FROM requests WHERE conversation_id=? AND id!=?) WHERE id=?',
         )
         .run(cid, id, cid, id, cid);
-      this.refreshFlags(cid);
+      this.refreshFlags(cid, id);
     }
   }
 }
@@ -549,7 +669,7 @@ export function backfillConversations(db: Database, restore: (id: number) => Uin
   const staged = new Database(':memory:');
   try {
     staged.exec(
-      'CREATE TABLE requests(id INTEGER PRIMARY KEY,received_at INTEGER,source TEXT,model TEXT,usage_json TEXT,cost_json TEXT)',
+      'CREATE TABLE IF NOT EXISTS requests(id INTEGER PRIMARY KEY,received_at INTEGER,source TEXT,model TEXT,usage_json TEXT,cost_json TEXT)',
     );
     installConversationSchema(staged);
     const index = new ConversationIndex(staged);
@@ -571,13 +691,8 @@ export function backfillConversations(db: Database, restore: (id: number) => Uin
       staged.transaction(() => index.insert(row.id, row, prepared)).immediate();
     }
     db.transaction(() => {
-      const installed = (db.query('PRAGMA table_info(requests)').all() as { name: string }[]).some(
-        (c) => c.name === 'conversation_id',
-      );
-      if (!installed) installConversationSchema(db);
-      else {
-        db.exec('DELETE FROM conversation_models; DELETE FROM threads; DELETE FROM conversations;');
-      }
+      installConversationSchema(db);
+      db.exec('DELETE FROM conversation_models; DELETE FROM threads; DELETE FROM conversations;');
       const cols = Object.keys(requestIndexColumns);
       for (const row of staged
         .query<Record<string, SQLQueryBindings>, []>('SELECT * FROM requests')
@@ -596,7 +711,7 @@ export function backfillConversations(db: Database, restore: (id: number) => Uin
           ).run(...Object.values(row));
         }
       }
-      db.exec('PRAGMA user_version=3');
+      db.exec('PRAGMA user_version=4');
     }).immediate();
   } finally {
     staged.close();

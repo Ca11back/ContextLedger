@@ -30,7 +30,7 @@ function useFragments(id: number, startTurn: number | undefined, untilTurn?: num
   return { query, turns };
 }
 
-function TurnBlock({
+export function TurnBlock({
   view,
   anchored,
   openRaw,
@@ -63,7 +63,7 @@ function TurnBlock({
       <article
         ref={node}
         id={`turn-${turn.turnIndex}`}
-        className={`turn${anchored ? ' anchored' : ''}`}
+        className={`turn${anchored ? ' anchored' : ''}${turn.superseded ? ' superseded' : ''}`}
         aria-label={`第 ${turn.turnIndex} 轮${anchored ? '，搜索命中' : ''}`}
       >
         <div className="rail" aria-hidden="true">
@@ -91,6 +91,7 @@ function TurnBlock({
             <span>{duration(turn.durationMs)}</span>
             {turn.model && <span>{turn.model}</span>}
             {turn.stopReason && <span title="模型给出的停止原因">停止原因 {turn.stopReason}</span>}
+            {turn.retryOf ? <span className="tag quiet">重试第 {turn.retryOf} 轮</span> : null}
             {turn.completeness === 'partial' && <span className="tag warn">回复不完整</span>}
             {turn.completeness === 'error' && <span className="tag danger">报错</span>}
             <button
@@ -115,13 +116,27 @@ function TurnBlock({
           {own.map((message) => (
             <Message key={message.messageId} message={message} />
           ))}
-          {turn.completeness === 'partial' && (
+          {turn.superseded ? (
             <p className="note">
-              回复没有完整采集。如果客户端在后续请求里带上了它收到的回复，会出现在下一轮开头。
+              {turn.completeness === 'error'
+                ? '这次请求失败，'
+                : turn.completeness === 'partial'
+                  ? '这次回复没有完整采集，'
+                  : ''}
+              客户端在后面用同样的内容重试了。
             </p>
-          )}
-          {turn.completeness === 'error' && own.every((message) => message.side === 'input') && (
-            <p className="note">这次请求报错，没有收到回复内容。详情见原始数据。</p>
+          ) : (
+            <>
+              {turn.completeness === 'partial' && (
+                <p className="note">
+                  回复没有完整采集。如果客户端在后续请求里带上了它收到的回复，会出现在下一轮开头。
+                </p>
+              )}
+              {turn.completeness === 'error' &&
+                own.every((message) => message.side === 'input') && (
+                  <p className="note">这次请求报错，没有收到回复内容。详情见原始数据。</p>
+                )}
+            </>
           )}
         </div>
       </article>
@@ -257,7 +272,7 @@ function Header({
       >
         <Icon name="left" size={14} /> {search.tab === 'requests' ? '请求列表' : '会话列表'}
       </button>
-      <h1>{c.title || '（没有用户消息）'}</h1>
+      <h1>{c.title || '（无标题）'}</h1>
       <p className="facts">
         <span>
           用户 <b>{c.user || '未知'}</b>
@@ -361,14 +376,20 @@ export function ConversationReader({
   // [ and ] jump between turns outside text inputs.
   useEffect(() => {
     const onKey = (event: KeyboardEvent) => {
-      if (event.isComposing || (event.key !== '[' && event.key !== ']')) return;
+      if (event.isComposing || event.metaKey || event.ctrlKey || event.altKey) return;
+      if (event.key !== '[' && event.key !== ']') return;
       const target = event.target as HTMLElement | null;
-      if (target && ['INPUT', 'TEXTAREA', 'SELECT'].includes(target.tagName)) return;
+      if (
+        target &&
+        (target.isContentEditable || ['INPUT', 'TEXTAREA', 'SELECT'].includes(target.tagName))
+      )
+        return;
       const nodes = [...document.querySelectorAll<HTMLElement>('.reader .turn')];
-      const index = nodes.findIndex((node) => node.getBoundingClientRect().top > 80);
-      const target2 =
-        event.key === ']' ? nodes[index === -1 ? nodes.length - 1 : index] : nodes[index - 2];
-      target2?.scrollIntoView({ block: 'start' });
+      // First turn below the reading line; the current turn is the one before it.
+      const found = nodes.findIndex((node) => node.getBoundingClientRect().top > 80);
+      const index = found === -1 ? nodes.length : found;
+      const next = event.key === ']' ? nodes[Math.min(index, nodes.length - 1)] : nodes[index - 2];
+      next?.scrollIntoView({ block: 'start' });
     };
     window.addEventListener('keydown', onKey);
     return () => window.removeEventListener('keydown', onKey);

@@ -4,6 +4,8 @@ import { renderToStaticMarkup } from 'react-dom/server';
 import { createDashboardQueryClient } from '../src/client/queries';
 import type { MessageView } from '../src/client/transcript';
 import { Message } from '../src/components/Message';
+import { TurnBlock } from '../src/components/Reader';
+import type { TurnSummary } from '../src/conversation-contracts';
 
 function render(message: MessageView) {
   const client = createDashboardQueryClient();
@@ -86,4 +88,54 @@ test('a long part offers continuation with loaded and total size', () => {
     ],
   });
   expect(html).toContain('继续载入（已显示 8,192 / 20,000 字）');
+});
+
+test('superseded attempts are dimmed with a retry note and retries are labelled', () => {
+  const turn = (turnIndex: number, extra: Partial<TurnSummary>): TurnSummary => ({
+    turnIndex,
+    recordId: turnIndex,
+    requestId: `req-${turnIndex}`,
+    receivedAt: 0,
+    model: 'm',
+    inputTokens: null,
+    outputTokens: null,
+    charge: null,
+    durationMs: null,
+    completeness: 'complete',
+    linkRule: 'prefix',
+    parentOutputIncomplete: false,
+    contextReset: null,
+    media: false,
+    ...extra,
+  });
+  const renderTurn = (summary: TurnSummary) => {
+    const client = createDashboardQueryClient();
+    try {
+      return renderToStaticMarkup(
+        <QueryClientProvider client={client}>
+          <TurnBlock
+            view={{ turn: summary, reset: null, messages: [] }}
+            anchored={false}
+            openRaw={() => {}}
+            spurs={[]}
+            go={() => {}}
+            search={{}}
+          />
+        </QueryClientProvider>,
+      );
+    } finally {
+      client.clear();
+    }
+  };
+  const failed = renderTurn(turn(1, { completeness: 'error', superseded: true }));
+  expect(failed).toContain('turn superseded');
+  expect(failed).toContain('这次请求失败，');
+  expect(failed).toContain('客户端在后面用同样的内容重试了');
+  expect(failed).not.toContain('这次请求报错，没有收到回复内容');
+  const complete = renderTurn(turn(2, { superseded: true }));
+  expect(complete).not.toContain('没有完整采集');
+  expect(complete).toContain('客户端在后面用同样的内容重试了');
+  const retry = renderTurn(turn(3, { retryOf: 1 }));
+  expect(retry).toContain('重试第 1 轮');
+  expect(retry).not.toContain('superseded');
 });

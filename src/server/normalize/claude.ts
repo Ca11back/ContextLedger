@@ -2,6 +2,7 @@ import { object } from '../../contracts';
 import {
   type AdapterResult,
   array,
+  boundedUserText,
   type CapturedEvent,
   mediaDisplay,
   message,
@@ -58,9 +59,18 @@ function block(value: unknown, role: string, completed = true): NormalizedMessag
   return message('other', { ...b, role }, [value], { role }, completed);
 }
 function blocks(content: unknown, role: string, completed = true): NormalizedMessage[] {
-  return (typeof content === 'string' ? [{ type: 'text', text: content }] : array(content)).map(
-    (item) => block(item, role, completed),
-  );
+  const items = typeof content === 'string' ? [{ type: 'text', text: content }] : array(content);
+  const userText =
+    role === 'user'
+      ? boundedUserText(
+          items.flatMap((item) => (object(item).type === 'text' ? [object(item).text] : [])),
+        )
+      : '';
+  return items.map((item) => {
+    const result = block(item, role, completed);
+    if (result.kind === 'user') result.userText = userText;
+    return result;
+  });
 }
 interface BlockState {
   value: Record<string, unknown>;

@@ -526,6 +526,13 @@ fieldset {
   place-items: center;
   font: 600 10px var(--mono);
 }
+/* Dim the superseded attempt's content; head and retry note stay at full contrast. */
+.turn.superseded .turn-body > :not(.turn-head):not(.note) {
+  opacity: 0.6;
+}
+.turn.superseded .node {
+  border-style: dashed;
+}
 .turn.anchored .node {
   background: var(--ink);
   color: var(--mark);

@@ -28,6 +28,8 @@ export interface NormalizedMessage {
   media?: { label: string };
   alternatives?: number;
   parts: NormalizedPart[];
+  /** Actual source user text only, bounded to 120 UTF-16 units; never display placeholders. */
+  userText: string;
   /** Full, uncapped per-format identity projection hash; never hashes display labels. */
   itemHash: string;
   completed: boolean;
@@ -50,6 +52,8 @@ export interface NormalizedRequest {
   /** Count of input ++ evidence, for coverage against a child's input. */
   evidenceCount: number;
   inputChain: string | null;
+  /** Full-input fingerprint even for previous_response_id mode and empty inputs. */
+  retryInputChain: string;
   evidenceChain: string | null;
   /** Entry i covers input[0..i], in sequence order. Storage queries newest <=4096. */
   inputPrefixes: string[];
@@ -57,6 +61,8 @@ export interface NormalizedRequest {
   responseId: string | null;
   previousResponseId: string | null;
   title: string;
+  /** Last non-empty actual source user text in the full input, including leading history. */
+  lastUserText: string;
   leadingHistoryCount: number;
   media: boolean;
   stopReason: string | null;

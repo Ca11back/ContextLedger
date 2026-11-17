@@ -1,6 +1,6 @@
 import { useQuery } from '@tanstack/react-query';
 import { useEffect, useRef, useState } from 'react';
-import brandMark from '../assets/brand/contextledger-mark-v2.png';
+import brandMark from '../assets/brand/contextledger-mark-128.png';
 import { bytes, dateTime } from '../client/format';
 import { lookupQuery, metricsQuery, uploadsQuery } from '../client/queries';
 import type { AppSearch } from '../client/search';

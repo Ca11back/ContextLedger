@@ -1,4 +1,5 @@
 import { type Envelope, object } from '../../contracts';
+import { hash } from '../codec';
 import { identityId, isolationDomain, parseCodexIdentity } from '../identity';
 import { chat } from './chat';
 import { claude } from './claude';
@@ -67,7 +68,12 @@ export function normalizeEnvelope(envelope: Envelope): NormalizedRequest {
       ? 'partial'
       : 'complete';
   const input = adapted.input.map((m, index) => ({ ...m, side: 'input' as const, index }));
-  const output = adapted.output.map((m, index) => ({ ...m, side: 'output' as const, index }));
+  const output = adapted.output.map((m, index) => ({
+    ...m,
+    side: 'output' as const,
+    index,
+    userText: '',
+  }));
   const evidence =
     completeness === 'error'
       ? []
@@ -86,16 +92,15 @@ export function normalizeEnvelope(envelope: Envelope): NormalizedRequest {
     (m) => !['system', 'context', 'reasoning', 'other'].includes(m.kind),
   );
   const inputChain = previousResponseId ? null : (inputPrefixes.at(-1) ?? null);
+  const retryInputChain = inputPrefixes.at(-1) ?? hash('cl-chain-v1');
   const evidenceChain =
     !previousResponseId && completeness !== 'error' && inputEligible && hasContent(evidence)
       ? (chainHashes(evidence, inputPrefixes.at(-1) ?? 'cl-chain-v1').at(-1) ?? null)
       : null;
   const leading = leadingHistoryCount(input);
+  const lastUserText = input.reduce((latest, m) => m.userText || latest, '');
   const titleText =
-    input
-      .slice(leading)
-      .find((m) => m.kind === 'user')
-      ?.parts.find((p) => p.kind === 'text')?.text ?? '';
+    input.slice(leading).find((m) => m.userText.length > 0)?.userText ?? lastUserText;
   return {
     protocol,
     chat: chatProtocols.has(protocol),
@@ -110,12 +115,14 @@ export function normalizeEnvelope(envelope: Envelope): NormalizedRequest {
     inputCount: input.length,
     evidenceCount: input.length + evidence.length,
     inputChain,
+    retryInputChain,
     evidenceChain,
     inputPrefixes,
     inputEligible,
     responseId: adapted.responseId || null,
     previousResponseId,
-    title: titleText.slice(0, /[\uD800-\uDBFF]/.test(titleText[119] ?? '') ? 119 : 120),
+    title: titleText,
+    lastUserText,
     leadingHistoryCount: leading,
     media: [...input, ...output].some((m) => Boolean(m.media)),
     stopReason: adapted.stopReason || null,

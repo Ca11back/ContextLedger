@@ -37,6 +37,8 @@ interface RequestDb extends RecordMeta {
   evidence_count: number;
   parent_coverage: number;
   stop_reason: string | null;
+  retry_of_turn: number | null;
+  superseded: number;
 }
 interface ConversationDb {
   id: number;
@@ -65,7 +67,7 @@ interface ConversationDb {
 }
 const requestColumns = `id,received_at,source,host_request_id,model,user_label,token_label,truncated,media,duration_ms,
   protocol,completeness,input_tokens,output_tokens,charge_quota,conversation_id,turn_index,link_rule,parent_id,
-  context_reset,evidence_count,parent_coverage,stop_reason`;
+  context_reset,evidence_count,parent_coverage,stop_reason,retry_of_turn,superseded`;
 const conversationSelect = `SELECT c.*, t.subagent_of, t.agent_name, t.subagent_kind,
   CASE WHEN c.id=t.primary_conversation_id THEN coalesce(t.subagent_count,0) ELSE 0 END AS subagent_count,
   (SELECT user_label FROM requests WHERE conversation_id=c.id ORDER BY turn_index LIMIT 1) AS user_label,
@@ -164,6 +166,8 @@ function turnView(row: RequestDb): TurnSummary {
     contextReset: row.context_reset,
     media: !!row.media,
     stopReason: row.stop_reason,
+    retryOf: row.retry_of_turn,
+    superseded: !!row.superseded,
   };
 }
 function requestView(row: RequestDb): RequestRow {
@@ -251,12 +255,16 @@ function filters(params: URLSearchParams, conversation: boolean) {
         );
         continue;
       }
-      if (conversation)
-        where.push(
-          'EXISTS(SELECT 1 FROM requests f WHERE f.conversation_id=c.id AND f.completeness=?)',
-        );
-      else where.push('r.completeness=?');
-      args.push(value);
+      if (conversation && (value === 'error' || value === 'partial')) {
+        where.push(value === 'error' ? 'c.has_error=1' : 'c.has_partial=1');
+      } else {
+        if (conversation)
+          where.push(
+            'EXISTS(SELECT 1 FROM requests f WHERE f.conversation_id=c.id AND f.completeness=?)',
+          );
+        else where.push('r.completeness=?');
+        args.push(value);
+      }
     } else {
       const column = {
         request: 'host_request_id',

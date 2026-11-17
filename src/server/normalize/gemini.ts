@@ -2,6 +2,7 @@ import { object } from '../../contracts';
 import {
   type AdapterResult,
   array,
+  boundedUserText,
   type CapturedEvent,
   mediaDisplay,
   message,
@@ -32,6 +33,18 @@ function appendPart(parts: Record<string, unknown>[], value: unknown): void {
 function normalizeParts(values: unknown, role: string, completed = true): NormalizedMessage[] {
   const parts: Record<string, unknown>[] = [];
   for (const value of array(values)) appendPart(parts, value);
+  const userText =
+    role === 'user'
+      ? boundedUserText(
+          parts.flatMap((p) =>
+            typeof p.text === 'string' &&
+            p.thought !== true &&
+            Object.keys(p).every((key) => ['text', 'thought', 'thoughtSignature'].includes(key))
+              ? [p.text]
+              : [],
+          ),
+        )
+      : '';
   return parts.map((p) => {
     const fields = { role };
     if (typeof p.text === 'string') {
@@ -42,7 +55,7 @@ function normalizeParts(values: unknown, role: string, completed = true): Normal
         known ? (p.thought === true ? 'reasoning' : roleKind(role)) : 'other',
         { role, part: p },
         known ? [p.text] : [p],
-        fields,
+        { ...fields, userText },
         completed,
       );
     }

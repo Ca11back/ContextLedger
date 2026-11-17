@@ -104,7 +104,11 @@ function useRowKeys(ids: number[], current: number | undefined, open: (id: numbe
     const onKey = (event: KeyboardEvent) => {
       if (event.isComposing || event.metaKey || event.ctrlKey || event.altKey) return;
       const target = event.target as HTMLElement | null;
-      if (target && ['INPUT', 'TEXTAREA', 'SELECT'].includes(target.tagName)) return;
+      if (
+        target &&
+        (target.isContentEditable || ['INPUT', 'TEXTAREA', 'SELECT'].includes(target.tagName))
+      )
+        return;
       if (event.key !== 'j' && event.key !== 'k') return;
       const index = current === undefined ? -1 : ids.indexOf(current);
       const next = ids[event.key === 'j' ? index + 1 : Math.max(0, index - 1)];
@@ -155,7 +159,7 @@ export function ConversationList({ search, go }: { search: AppSearch; go: Naviga
                 aria-current={search.c === row.id ? 'true' : undefined}
                 onClick={() => open(row.id)}
               >
-                <span className="row-title">{row.title || '（没有用户消息）'}</span>
+                <span className="row-title">{row.title || '（无标题）'}</span>
                 <span className="row-meta">
                   <span>{row.user || '未知用户'}</span>
                   <span>{row.models[0] ?? '未知模型'}</span>

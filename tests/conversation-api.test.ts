@@ -1,9 +1,11 @@
 import { afterEach, expect, test } from 'bun:test';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { estimateRetry } from '../.trellis/tasks/11-17-conversation-backend/research/retry-estimate';
 import type { Envelope } from '../src/contracts';
 import type { Fragment, FragmentPage } from '../src/conversation-contracts';
+import { hash } from '../src/server/codec';
 import type { Config } from '../src/server/config';
 import {
   boundedJson,
@@ -572,4 +574,175 @@ test('turn summaries expose stored protocol stop reasons without restoring evide
   expect(turns(store, root.conversation, new URLSearchParams()).turns[0]!.stopReason).toBe(
     'MAX_TOKENS',
   );
+});
+
+test('retry turns retain failed attempts, terminal status filters clear after success, historical request errors remain', async () => {
+  const store = fixture();
+  const input = [{ role: 'user', content: 'repeat this exact input' }];
+  const declared = {
+    client_metadata: { 'x-codex-turn-metadata': JSON.stringify({ thread_id: 'api-retry-thread' }) },
+  };
+  const fail = () => {
+    const env = envelope(input, [], declared);
+    (env.report.response as Record<string, unknown>).status = 502;
+    return env;
+  };
+  const first = await insert(store, fail());
+  const second = await insert(store, fail());
+  expect(second.conversation).toBe(first.conversation);
+  expect(
+    conversations(store, new URLSearchParams({ status: 'error' })).rows.map((row) => row.id),
+  ).toEqual([first.conversation]);
+  const last = await insert(store, envelope(input, undefined, declared));
+  expect(last.conversation).toBe(first.conversation);
+  const page = turns(store, first.conversation, new URLSearchParams());
+  bounded(page);
+  expect(
+    page.turns.map((turn) => ({
+      record: turn.recordId,
+      retryOf: turn.retryOf,
+      superseded: turn.superseded,
+      completeness: turn.completeness,
+    })),
+  ).toEqual([
+    { record: first.id, retryOf: null, superseded: true, completeness: 'error' },
+    { record: second.id, retryOf: first.turn, superseded: true, completeness: 'error' },
+    { record: last.id, retryOf: second.turn, superseded: false, completeness: 'complete' },
+  ]);
+  expect(conversations(store, new URLSearchParams({ status: 'error' })).rows).toEqual([]);
+  expect(conversations(store, new URLSearchParams({ status: 'partial' })).rows).toEqual([]);
+  const row = conversations(store, new URLSearchParams()).rows[0]!;
+  expect(row.hasError).toBe(false);
+  expect(row.hasPartial).toBe(false);
+  expect(row.ownTurns).toBe(3);
+  expect(
+    requests(store, new URLSearchParams({ status: 'error' })).rows.map((row) => row.recordId),
+  ).toEqual([second.id, first.id]);
+  const partial = envelope(input, [], declared);
+  (partial.report.response as Record<string, unknown>).truncated = true;
+  const latest = await insert(store, partial);
+  expect(latest.conversation).toBe(first.conversation);
+  expect(
+    conversations(store, new URLSearchParams({ status: 'partial' })).rows.map((row) => row.id),
+  ).toEqual([first.conversation]);
+  expect(conversations(store, new URLSearchParams({ status: 'error' })).rows).toEqual([]);
+  expect(
+    collect(store, first.conversation).all.filter((fragment) => fragment.type === 'turn').length,
+  ).toBe(4);
+});
+
+test('retry metadata and list titles use persisted projections without restoring request evidence', async () => {
+  const store = fixture();
+  const declared = {
+    client_metadata: {
+      'x-codex-turn-metadata': JSON.stringify({ thread_id: 'metadata-retry-thread' }),
+    },
+  };
+  const first = await insert(
+    store,
+    envelope([{ role: 'user', content: 'metadata title' }], undefined, declared),
+  );
+  const latest = await insert(
+    store,
+    envelope([{ role: 'user', content: 'metadata title' }], undefined, declared),
+  );
+  const restore = store.restore;
+  store.restore = () => {
+    throw new Error('metadata list must not restore evidence');
+  };
+  try {
+    const summary = turns(store, first.conversation, new URLSearchParams()).turns;
+    expect(summary[1]!.retryOf).toBe(first.turn);
+    expect(summary[0]!.superseded).toBe(true);
+    expect(conversations(store, new URLSearchParams()).rows[0]!.title).toBe('metadata title');
+    expect(requests(store, new URLSearchParams()).rows.map((row) => row.recordId)).toEqual([
+      latest.id,
+      first.id,
+    ]);
+  } finally {
+    store.restore = restore;
+  }
+});
+
+test('read-only frozen shadow replay reduces synthetic historical branches and flags without changing source evidence or membership', async () => {
+  const store = fixture();
+  const input = [{ role: 'user', content: 'synthetic project plan' }];
+  const root = await insert(store, envelope(input));
+  const followup = [
+    ...input,
+    { role: 'assistant', content: 'answer' },
+    { type: 'function_call_output', call_id: 'synthetic-call', output: 'synthetic tool result' },
+  ];
+  const failed = () => {
+    const env = envelope(followup, []);
+    (env.report.response as Record<string, unknown>).status = 502;
+    return env;
+  };
+  await insert(store, failed());
+  await insert(store, failed());
+  await insert(store, envelope(followup));
+  // Simulate the previous schema3 assignment projection, only in this disposable synthetic DB:
+  // an error continues root1; the next error and the final success fork into empty-title branches.
+  const columns = (
+    store.db.query('PRAGMA table_info(conversations)').all() as { name: string }[]
+  ).map((row) => row.name);
+  for (const conversation of [2, 3]) {
+    const expressions = columns.map(
+      (column) =>
+        ({
+          id: String(conversation),
+          title: "''",
+          forked_from_conversation: String(root.conversation),
+          forked_from_turn: String(root.turn),
+        })[column] ?? column,
+    );
+    store.db.exec(
+      `INSERT INTO conversations(${columns.join(',')}) SELECT ${expressions.join(',')} FROM conversations WHERE id=${root.conversation}`,
+    );
+  }
+  store.db.exec(
+    'UPDATE requests SET conversation_id=2,turn_index=1 WHERE id=3; UPDATE requests SET conversation_id=3,turn_index=1 WHERE id=4; PRAGMA user_version=3',
+  );
+  const assignments = store.db
+    .query('SELECT id,conversation_id,turn_index FROM requests ORDER BY id')
+    .all();
+  const fingerprints = () =>
+    ['', '-wal'].map((suffix) =>
+      existsSync(store.config.database + suffix)
+        ? hash(readFileSync(store.config.database + suffix))
+        : null,
+    );
+  const before = fingerprints();
+  const result = estimateRetry(store.config.database, 218);
+  expect(result.before).toMatchObject({
+    requests: 4,
+    conversations: 3,
+    branches: 2,
+    emptyTitles: 2,
+    red: 2,
+    partial: 0,
+  });
+  expect(result.after).toMatchObject({
+    requests: 4,
+    conversations: 1,
+    branches: 0,
+    emptyTitles: 0,
+    red: 0,
+    partial: 0,
+  });
+  expect(result.verifiedRecords).toBe(4);
+  expect(result.after.evidenceDigest).toBe(result.before.evidenceDigest);
+  expect(fingerprints()).toEqual(before);
+  expect(
+    store.db.query('SELECT id,conversation_id,turn_index FROM requests ORDER BY id').all(),
+  ).toEqual(assignments);
+  expect(store.db.query('PRAGMA user_version').get()).toEqual({ user_version: 3 });
+  expect(JSON.stringify(result)).not.toContain('synthetic project plan');
+  error(() => {
+    try {
+      estimateRetry(store.config.database, 217);
+    } catch {
+      throw new LedgerError(400, 'fixed_cutoff_required');
+    }
+  }, 400);
 });

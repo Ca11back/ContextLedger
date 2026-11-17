@@ -1,17 +1,49 @@
+import { Database } from 'bun:sqlite';
+import { existsSync } from 'node:fs';
 import { loadConfig } from '../src/server/config';
 import { Ledger } from '../src/server/storage';
 
-// Opening schema-v2 verifies every root and atomically publishes the v3 index.
-// A v3 database is left intact: rebuilding it could renumber retained deep links.
-const ledger = new Ledger(loadConfig());
-try {
+// Before an approved deployment, stop the collector and run this command with
+// --backup <new-path>. The backup is taken BEFORE Ledger opens/migrates schema2/3.
+// --rebuild explicitly recomputes an existing schema4 index; conversation/turn ids
+// may change. Original request ids, exact evidence, charges and CAS stay intact.
+const args = process.argv.slice(2);
+if (args.includes('--help')) {
   console.log(
-    JSON.stringify({
-      schema: 3,
-      records: ledger.metrics().records,
-      conversations: ledger.db.query('SELECT count(*) AS count FROM conversations').get(),
-    }),
+    'bun run scripts/backfill-conversations.ts [--backup <new-path>] [--rebuild]\nStop the collector and back up before deployment. Opening schema2/3 migrates to schema4; --rebuild also recomputes schema4 membership. Derived conversation/turn ids may change.',
   );
-} finally {
-  ledger.close();
+} else {
+  if (
+    args.some(
+      (arg, index) => arg !== '--rebuild' && arg !== '--backup' && args[index - 1] !== '--backup',
+    )
+  )
+    throw new Error('Unknown argument');
+  const config = loadConfig();
+  const backupAt = args.indexOf('--backup');
+  if (backupAt !== -1) {
+    const destination = args[backupAt + 1];
+    if (!destination || destination.startsWith('--'))
+      throw new Error('Supply --backup destination');
+    if (existsSync(destination)) throw new Error('Backup destination exists');
+    const source = new Database(config.database, { readonly: true, strict: true });
+    try {
+      source.query('VACUUM INTO ?').run(destination);
+    } finally {
+      source.close();
+    }
+  }
+  const ledger = new Ledger(config);
+  try {
+    if (args.includes('--rebuild')) ledger.rebuildConversations();
+    console.log(
+      JSON.stringify({
+        schema: 4,
+        records: ledger.metrics().records,
+        conversations: ledger.db.query('SELECT count(*) AS count FROM conversations').get(),
+      }),
+    );
+  } finally {
+    ledger.close();
+  }
 }

@@ -77,6 +77,10 @@ export interface TurnSummary {
   contextReset: ContextReset;
   /** Model stop reason as reported (e.g. MAX_TOKENS, SAFETY, length), when known. */
   stopReason?: string | null;
+  /** Same-conversation turn this request retries (identical input), when it is a retry. */
+  retryOf?: number | null;
+  /** A later turn in this conversation retried this one with identical input. */
+  superseded?: boolean;
   media: boolean;
 }
 

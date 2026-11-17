@@ -61,7 +61,7 @@ export class Ledger {
       throw new Error('Database requires WAL mode');
     const version = (this.db.query('PRAGMA user_version').get() as { user_version: number })
       .user_version;
-    if (version !== 0 && version !== 2 && version !== 3)
+    if (version !== 0 && version !== 2 && version !== 3 && version !== 4)
       throw new Error('Unsupported database format');
     this.db.exec(`CREATE TABLE IF NOT EXISTS requests (
       id INTEGER PRIMARY KEY AUTOINCREMENT, received_at INTEGER NOT NULL, source TEXT NOT NULL, upload_id TEXT NOT NULL,
@@ -87,11 +87,11 @@ export class Ledger {
       CREATE INDEX IF NOT EXISTS pending_pins_hash ON pending_pins(hash);
       `);
     try {
-      if (version === 2) backfillConversations(this.db, (id) => this.restore(id));
+      if (version === 2 || version === 3) backfillConversations(this.db, (id) => this.restore(id));
       else if (version === 0)
         this.transaction(() => {
           installConversationSchema(this.db);
-          this.db.exec('PRAGMA user_version=3');
+          this.db.exec('PRAGMA user_version=4');
         });
       this.conversations = new ConversationIndex(this.db);
     } catch (error) {
@@ -127,7 +127,7 @@ export class Ledger {
       reusable: free * page,
       logical:
         scalar(
-          "SELECT coalesce(sum(length(payload)+length(usage_json)+length(cost_json)+length(CAST(coalesce(response_id,'') AS BLOB))+length(CAST(coalesce(user_id,'') AS BLOB))+length(CAST(coalesce(token_id,'') AS BLOB))+length(CAST(protocol AS BLOB))+1536),0) FROM requests",
+          "SELECT coalesce(sum(length(payload)+length(usage_json)+length(cost_json)+length(CAST(coalesce(response_id,'') AS BLOB))+length(CAST(coalesce(user_id,'') AS BLOB))+length(CAST(coalesce(token_id,'') AS BLOB))+length(CAST(protocol AS BLOB))+length(CAST(last_user_text AS BLOB))+length(CAST(coalesce(previous_response_id,'') AS BLOB))+2048),0) FROM requests",
         ) +
         scalar('SELECT coalesce(sum(length(compressed)+128),0) FROM objects') +
         scalar(
@@ -207,6 +207,7 @@ export class Ledger {
       prepared.payload.length +
       16_384 +
       Buffer.byteLength(normalized.responseId ?? '') +
+      Buffer.byteLength(normalized.previousResponseId ?? '') +
       3 *
         (Buffer.byteLength(normalized.userId ?? '') +
           Buffer.byteLength(normalized.tokenId ?? '') +
@@ -592,6 +593,9 @@ export class Ledger {
       return { checked: this.metrics().records, mismatches: errors.length, rebuilt: rebuild };
     };
     return rebuild ? this.transaction(check) : this.db.transaction(check).deferred();
+  }
+  rebuildConversations() {
+    backfillConversations(this.db, (id) => this.restore(id));
   }
   backup(destination: string) {
     if (existsSync(destination)) throw new Error('Backup destination exists');

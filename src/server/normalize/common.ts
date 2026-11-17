@@ -37,7 +37,13 @@ export function message(
   kind: MessageKind,
   projection: unknown,
   values: unknown[] = [],
-  fields: { role?: unknown; name?: unknown; callId?: unknown; media?: unknown } = {},
+  fields: {
+    role?: unknown;
+    name?: unknown;
+    callId?: unknown;
+    media?: unknown;
+    userText?: string;
+  } = {},
   completed = true,
 ): NormalizedMessage {
   const parts = values.map(part);
@@ -50,6 +56,7 @@ export function message(
     callId: label(fields.callId),
     ...(fields.media === undefined ? {} : { media: { label: label(fields.media) ?? 'media' } }),
     parts,
+    userText: kind === 'user' ? boundedUserText([fields.userText]) : '',
     itemHash: hash(canonicalJson(projection)),
     completed,
     evidence:
@@ -131,6 +138,29 @@ export function contentValues(content: unknown): unknown[] {
 export function contentProjection(content: unknown): unknown[] {
   if (typeof content === 'string') return [{ type: 'text', text: content }];
   return array(content).map(knownTextPart);
+}
+
+/** Bounded summaries are separate from the full content identity and raw evidence. */
+export function boundedUserText(values: Iterable<unknown>): string {
+  let text = '';
+  for (const value of values) {
+    if (typeof value !== 'string' || value.trim().length === 0) continue;
+    text += `${text ? '\n' : ''}${value.trim().slice(0, 121)}`;
+    if (text.length >= 120) break;
+  }
+  const end = /[\uD800-\uDBFF]/.test(text[119] ?? '') ? 119 : 120;
+  return text.slice(0, end);
+}
+
+/** Read known text leaves before media display or unknown-JSON previews are generated. */
+export function sourceUserText(content: unknown): string {
+  if (typeof content === 'string') return boundedUserText([content]);
+  return boundedUserText(
+    array(content).flatMap((value) => {
+      const p = object(value);
+      return ['input_text', 'output_text', 'text'].includes(string(p.type)) ? [p.text] : [];
+    }),
+  );
 }
 
 /** Gateway media descriptions are labels only; never resolve or fetch their URLs. */

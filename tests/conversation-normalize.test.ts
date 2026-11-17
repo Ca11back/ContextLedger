@@ -734,3 +734,223 @@ test('legacy and modern Chat tool fields can coexist without altering captured o
   normalizeEnvelope(raw);
   expect(JSON.stringify(raw)).toBe(before);
 });
+
+// Build native source messages so generated media display text cannot accidentally
+// satisfy the title assertions. Each protocol includes its real tool-result shape.
+const userTextFormats = [
+  {
+    format: 'openai',
+    body: (messages: unknown[]) => ({ messages }),
+    user: (texts: string[], media = false) => ({
+      role: 'user',
+      content: [
+        ...(media
+          ? [{ type: 'image_url', image_url: { url: 'https://example.invalid/generated-image' } }]
+          : []),
+        ...texts.map((text) => ({ type: 'text', text })),
+      ],
+    }),
+    unknown: { role: 'user', content: [{ type: 'future_part', text: 'unknown JSON preview' }] },
+    tail: [
+      {
+        role: 'assistant',
+        content: null,
+        tool_calls: [{ id: 'c', type: 'function', function: { name: 'tool', arguments: '{}' } }],
+      },
+      { role: 'tool', tool_call_id: 'c', content: 'tool result must not become a title' },
+    ],
+  },
+  {
+    format: 'openai_responses',
+    body: (input: unknown[]) => ({ input }),
+    user: (texts: string[], media = false) => ({
+      role: 'user',
+      content: [
+        ...(media
+          ? [{ type: 'input_image', image_url: 'https://example.invalid/generated-image' }]
+          : []),
+        ...texts.map((text) => ({ type: 'input_text', text })),
+      ],
+    }),
+    unknown: { type: 'future_item', role: 'user', text: 'unknown JSON preview' },
+    tail: [
+      { type: 'function_call', call_id: 'c', name: 'tool', arguments: '{}' },
+      {
+        type: 'function_call_output',
+        call_id: 'c',
+        output: { text: 'tool result must not become a title' },
+      },
+    ],
+  },
+  {
+    format: 'claude',
+    body: (messages: unknown[]) => ({ messages }),
+    user: (texts: string[], media = false) => ({
+      role: 'user',
+      content: [
+        ...(media
+          ? [
+              {
+                type: 'image',
+                source: { type: 'url', url: 'https://example.invalid/generated-image' },
+              },
+            ]
+          : []),
+        ...texts.map((text) => ({ type: 'text', text })),
+      ],
+    }),
+    unknown: { role: 'user', content: [{ type: 'future_block', text: 'unknown JSON preview' }] },
+    tail: [
+      { role: 'assistant', content: [{ type: 'tool_use', id: 'c', name: 'tool', input: {} }] },
+      {
+        role: 'user',
+        content: [
+          { type: 'tool_result', tool_use_id: 'c', content: 'tool result must not become a title' },
+        ],
+      },
+    ],
+  },
+  {
+    format: 'gemini',
+    body: (contents: unknown[]) => ({ contents }),
+    user: (texts: string[], media = false) => ({
+      role: 'user',
+      parts: [
+        ...(media
+          ? [
+              {
+                fileData: {
+                  mimeType: 'image/png',
+                  fileUri: 'https://example.invalid/generated-image',
+                },
+              },
+            ]
+          : []),
+        ...texts.map((text) => ({ text })),
+      ],
+    }),
+    unknown: {
+      role: 'user',
+      parts: [{ text: 'unknown JSON preview', future_field: 'not known text' }],
+    },
+    tail: [
+      { role: 'model', parts: [{ functionCall: { id: 'c', name: 'tool', args: {} } }] },
+      {
+        role: 'user',
+        parts: [
+          {
+            functionResponse: {
+              id: 'c',
+              name: 'tool',
+              response: { text: 'tool result must not become a title' },
+            },
+          },
+        ],
+      },
+    ],
+  },
+];
+
+for (const fixture of userTextFormats) {
+  test(`${fixture.format} title metadata excludes media placeholders, tool results and unknown previews`, () => {
+    const body = fixture.body([fixture.user([], true), ...fixture.tail, fixture.unknown]);
+    const before = JSON.stringify(body);
+    const result = normalize(fixture.format, body);
+    expect(result.lastUserText).toBe('');
+    expect(result.title).toBe('');
+    expect(result.input.every((m) => m.userText === '')).toBe(true);
+    expect(result.input.some((m) => m.parts.some((p) => p.text === '[图片]'))).toBe(true);
+    expect(JSON.stringify(body)).toBe(before);
+  });
+
+  test(`${fixture.format} last real user text includes leading history before trailing tool results`, () => {
+    const result = normalize(
+      fixture.format,
+      fixture.body([
+        fixture.user(['old real user text']),
+        fixture.user(['latest real user text'], true),
+        ...fixture.tail,
+      ]),
+    );
+    expect(result.leadingHistoryCount).toBeGreaterThan(0);
+    expect(result.input.slice(result.leadingHistoryCount).every((m) => m.userText === '')).toBe(
+      true,
+    );
+    expect(result.lastUserText).toBe('latest real user text');
+    expect(result.title).toBe('latest real user text');
+  });
+
+  test(`${fixture.format} genuine placeholder and literal URL text remain user text`, () => {
+    const literal = '[图片] https://example.invalid/user-typed';
+    const result = normalize(fixture.format, fixture.body([fixture.user([literal], true)]));
+    expect(result.lastUserText).toBe(literal);
+    expect(result.title).toBe(literal);
+    expect(result.input.find((m) => m.userText)?.userText).toBe(literal);
+  });
+
+  test(`${fixture.format} title text is bounded surrogate-safe and later real text fills an empty input`, () => {
+    const empty = normalize(fixture.format, fixture.body([fixture.user(['', '  '], true)]));
+    expect(empty.lastUserText).toBe('');
+    expect(empty.title).toBe('');
+    const text = `${'字'.repeat(119)}😀tail`;
+    const later = normalize(
+      fixture.format,
+      fixture.body([fixture.user(['', '  '], true), fixture.user([text], true), ...fixture.tail]),
+    );
+    expect(later.lastUserText).toBe('字'.repeat(119));
+    expect(later.title).toBe('字'.repeat(119));
+    expect(later.input.every((m) => m.userText.length <= 120)).toBe(true);
+    const fits = normalize(
+      fixture.format,
+      fixture.body([fixture.user([`${'a'.repeat(118)}😀tail`])]),
+    );
+    expect(fits.lastUserText).toBe(`${'a'.repeat(118)}😀`);
+    expect(fits.lastUserText).toHaveLength(120);
+  });
+
+  test(`${fixture.format} mixed source text selects actual text while display ordering stays intact`, () => {
+    const result = normalize(
+      fixture.format,
+      fixture.body([fixture.user(['first actual', 'second actual'], true)]),
+    );
+    const summary = result.lastUserText;
+    expect(summary).toContain('first actual');
+    expect(summary).toContain('second actual');
+    expect(summary).not.toContain('[图片]');
+    expect(summary).not.toContain('https://example.invalid/generated-image');
+    expect(result.input.filter((m) => m.kind === 'user').every((m) => m.userText === summary)).toBe(
+      true,
+    );
+  });
+}
+
+test('previous-response retries retain a full input fingerprint without introducing prefix chains', () => {
+  const plain = normalize('openai_responses', { instructions: 'system', input: [user] });
+  const one = normalize('openai_responses', {
+    instructions: 'system',
+    input: [user],
+    previous_response_id: 'previous',
+  });
+  const same = normalize(
+    'openai_responses',
+    { instructions: 'system', input: [user], previous_response_id: 'previous' },
+    responseFinal([responseMessage('different reply')]),
+  );
+  const edited = normalize('openai_responses', {
+    instructions: 'system',
+    input: [{ ...user, content: 'edited' }],
+    previous_response_id: 'previous',
+  });
+  expect(one.retryInputChain).toHaveLength(64);
+  expect(one.retryInputChain).toBe(same.retryInputChain);
+  expect(one.retryInputChain).toBe(plain.inputChain!);
+  expect(one.input.map((m) => m.itemHash)).toEqual(plain.input.map((m) => m.itemHash));
+  expect(one.inputPrefixes).toEqual(plain.inputPrefixes);
+  expect(one.retryInputChain).not.toBe(edited.retryInputChain);
+  expect(one.inputChain).toBeNull();
+  expect(one.evidenceChain).toBeNull();
+  const empty = normalize('openai_responses', { input: [], previous_response_id: 'previous' });
+  expect(empty.retryInputChain).toHaveLength(64);
+  expect(empty.retryInputChain).toBe(normalize('openai_responses', { input: [] }).retryInputChain);
+  expect(empty.retryInputChain).not.toBe(one.retryInputChain);
+});
