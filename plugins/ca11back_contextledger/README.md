@@ -15,6 +15,14 @@ This plugin only sends data. You need a running ContextLedger service that new-a
 - Use ContextLedger service 0.3.0 or later.
 - It is not a channel type. It needs no vendor account or API key.
 
+## Privacy
+
+This plugin stores what your users write to the models and what the models answer, in full. That can include personal data, internal documents or keys that someone pasted into a prompt.
+
+- The data goes only to the address you configure. Nothing is sent to the plugin author or any third party.
+- Tell your users that their conversations are recorded, and follow the rules that apply to you.
+- Limit who can sign in to ContextLedger, and use the request filter of the instance to skip groups or models you do not want recorded.
+
 ## Setup
 
 1. Install the plugin.
