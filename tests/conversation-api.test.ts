@@ -841,6 +841,49 @@ test('turns locate startTurn directly, prefix inherited input is hidden and lead
   );
 });
 
+test('detail exposes the last existing turn and fromTurn starts at the next existing turn', async () => {
+  const store = fixture();
+  let history: unknown[] = [];
+  const inserted: { id: number; conversation: number; turn: number }[] = [];
+  for (let index = 1; index <= 4; index++) {
+    history = [...history, { role: 'user', content: `turn ${index}` }];
+    inserted.push(await insert(store, envelope(history)));
+    history = [...history, { role: 'assistant', content: 'answer' }];
+  }
+  const conversation = inserted[0]!.conversation;
+  expect(inserted.every((row) => row.conversation === conversation)).toBe(true);
+  expect(conversationDetail(store, conversation).lastTurnIndex).toBe(4);
+  const firstTurn = (params: Record<string, string>) =>
+    fragments(store, conversation, new URLSearchParams(params)).fragments.find(
+      (f) => f.type === 'turn',
+    );
+  // Retention leaves a gap: exact startTurn reports it, fromTurn moves on to the next turn.
+  remove(store, inserted[1]!.id);
+  error(() => fragments(store, conversation, new URLSearchParams({ startTurn: '2' })), 404);
+  expect(firstTurn({ fromTurn: '2' })).toMatchObject({ turn: { turnIndex: 3 } });
+  expect(firstTurn({ fromTurn: '1' })).toMatchObject({ turn: { turnIndex: 1 } });
+  expect(fragments(store, conversation, new URLSearchParams({ fromTurn: '9' }))).toEqual({
+    fragments: [],
+    cursor: null,
+  });
+  error(() => fragments(store, conversation, new URLSearchParams({ fromTurn: '0' })), 400);
+  error(
+    () => fragments(store, conversation, new URLSearchParams({ fromTurn: '1', startTurn: '1' })),
+    400,
+  );
+  error(
+    () => fragments(store, conversation, new URLSearchParams({ fromTurn: '1', cursor: 'x' })),
+    400,
+  );
+  expect(
+    turns(store, conversation, new URLSearchParams({ fromTurn: '2' })).turns.map(
+      (t) => t.turnIndex,
+    ),
+  ).toEqual([3, 4]);
+  remove(store, inserted[3]!.id);
+  expect(conversationDetail(store, conversation).lastTurnIndex).toBe(3);
+});
+
 test('declared reset markers, branch metadata and direct subagent lists remain distinct', async () => {
   const store = fixture();
   const identity = (thread: string, window: string, parent?: string) => ({

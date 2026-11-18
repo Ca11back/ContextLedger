@@ -91,15 +91,25 @@ export function conversationQuery(id: number) {
   });
 }
 
-export function fragmentsQuery(id: number, startTurn: number | undefined) {
+/**
+ * Fragment stream of a conversation. `at` starts exactly at `startTurn` (404 when that turn is
+ * gone, for deep links); `from` starts at the first existing turn at or after it.
+ */
+export function fragmentsQuery(
+  id: number,
+  startTurn: number | undefined,
+  mode: 'at' | 'from' = 'at',
+) {
+  // From turn 1 is the whole conversation; share its cache entry with the unanchored stream.
+  const turn = mode === 'from' && startTurn !== undefined && startTurn <= 1 ? undefined : startTurn;
   return infiniteQueryOptions({
-    queryKey: ['fragments', id, startTurn ?? 0],
+    queryKey: ['fragments', id, turn ?? 0, turn === undefined ? 'at' : mode],
     initialPageParam: null as string | null,
     gcTime: 30_000,
     queryFn: ({ signal, pageParam }) => {
       const params = new URLSearchParams();
       if (pageParam) params.set('cursor', pageParam);
-      else if (startTurn) params.set('startTurn', String(startTurn));
+      else if (turn) params.set(mode === 'at' ? 'startTurn' : 'fromTurn', String(turn));
       return readJson<FragmentPage>(`/api/conversations/${id}/fragments?${params}`, signal);
     },
     getNextPageParam: (page) => page.cursor,

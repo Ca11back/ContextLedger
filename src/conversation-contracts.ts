@@ -79,6 +79,8 @@ export interface ConversationDetail {
   subagentOf: { id: number; title: string | null; removed: boolean } | null;
   subagentsPreview: (ConversationRef & { agentName: string | null })[];
   subagentCount: number;
+  /** Highest existing own turn index; null when the conversation has no retained turn. */
+  lastTurnIndex: number | null;
 }
 
 export interface TurnSummary {

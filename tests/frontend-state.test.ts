@@ -2,8 +2,19 @@ import { expect, test } from 'bun:test';
 import {
   conversationsQuery,
   createDashboardQueryClient,
+  fragmentsQuery,
   requestsQuery,
 } from '../src/client/queries';
+import {
+  EARLIER_STEP,
+  earlierRanges,
+  earlierStart,
+  initialStart,
+  mainStart,
+  movedUpByReader,
+  TAIL_TURNS,
+  upwardScrollKey,
+} from '../src/client/reading';
 import {
   appSearchSchema,
   conversationFilterKeys,
@@ -228,4 +239,69 @@ test('list requests carry sort=cost only to the conversation endpoint', async ()
   expect(conversationsQuery(validateAppSearch({ sort: 'cost' })).queryKey).not.toEqual(
     conversationsQuery(validateAppSearch({})).queryKey,
   );
+});
+
+test('the reader opens at the latest turns unless anchored and loads earlier ranges in steps', () => {
+  expect(TAIL_TURNS).toBe(5);
+  expect(EARLIER_STEP).toBe(10);
+  expect(initialStart(undefined)).toEqual({ kind: 'tail' });
+  expect(initialStart(7)).toEqual({ kind: 'anchor', turn: 7 });
+  // Latest five turns of a 40-turn conversation; short or empty ones start at turn 1.
+  expect(mainStart({ kind: 'tail' }, 40)).toBe(36);
+  expect(mainStart({ kind: 'tail' }, 3)).toBe(1);
+  expect(mainStart({ kind: 'tail' }, null)).toBe(1);
+  expect(mainStart({ kind: 'anchor', turn: 12 }, 40)).toBe(12);
+  expect(mainStart({ kind: 'top' }, 40)).toBe(1);
+  expect(earlierStart(36)).toBe(26);
+  expect(earlierStart(8)).toBe(1);
+  // Ranges are contiguous, oldest first, and end where the next later range begins.
+  expect(earlierRanges(36, [26, 16, 6, 1])).toEqual([
+    { from: 1, until: 6 },
+    { from: 6, until: 16 },
+    { from: 16, until: 26 },
+    { from: 26, until: 36 },
+  ]);
+  expect(earlierRanges(36, [])).toEqual([]);
+});
+
+test('fragment streams start exactly at anchors and from the next existing turn otherwise', async () => {
+  const urls: string[] = [];
+  const original = globalThis.fetch;
+  globalThis.fetch = (async (input: string | URL | Request) => {
+    urls.push(String(input));
+    return new Response(JSON.stringify({ fragments: [], cursor: null }), { status: 200 });
+  }) as typeof fetch;
+  const client = createDashboardQueryClient();
+  try {
+    await client.fetchInfiniteQuery(fragmentsQuery(4, 12));
+    await client.fetchInfiniteQuery(fragmentsQuery(4, 36, 'from'));
+    await client.fetchInfiniteQuery(fragmentsQuery(4, 1, 'from'));
+  } finally {
+    globalThis.fetch = original;
+    client.clear();
+  }
+  expect(urls).toEqual([
+    '/api/conversations/4/fragments?startTurn=12',
+    '/api/conversations/4/fragments?fromTurn=36',
+    '/api/conversations/4/fragments?',
+  ]);
+  // From turn 1 is the whole conversation and shares the unanchored cache entry.
+  expect(fragmentsQuery(4, 1, 'from').queryKey).toEqual(fragmentsQuery(4, undefined).queryKey);
+  expect(fragmentsQuery(4, 12, 'from').queryKey).not.toEqual(fragmentsQuery(4, 12).queryKey);
+});
+
+test('only reader intent releases the pin to the end, not layout', () => {
+  const before = { top: 1000, height: 2000 };
+  // Content grew below while pinned (late layout): no upward move, stays pinned.
+  expect(movedUpByReader(before, { scrollTop: 1000, scrollHeight: 3500 })).toBe(false);
+  // Placeholder above shrank: offset and height fall together (anchoring or clamping).
+  expect(movedUpByReader(before, { scrollTop: 826, scrollHeight: 1826 })).toBe(false);
+  // Home, scrollbar drag or a programmatic jump to the top.
+  expect(movedUpByReader(before, { scrollTop: 0, scrollHeight: 2000 })).toBe(true);
+  expect(movedUpByReader(before, { scrollTop: 980, scrollHeight: 2000 })).toBe(false);
+  for (const key of ['PageUp', 'ArrowUp', 'Home', '['])
+    expect(upwardScrollKey({ key, shiftKey: false })).toBe(true);
+  expect(upwardScrollKey({ key: ' ', shiftKey: true })).toBe(true);
+  expect(upwardScrollKey({ key: ' ', shiftKey: false })).toBe(false);
+  expect(upwardScrollKey({ key: 'End', shiftKey: false })).toBe(false);
 });

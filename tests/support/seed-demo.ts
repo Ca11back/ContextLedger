@@ -361,6 +361,19 @@ const scenarioRows = Object.fromEntries(
     ];
   }),
 );
+// A 40-turn conversation: opens at its latest turns; scrolling up loads earlier ranges.
+let longHistory: unknown[] = [user('长会话第 1 轮：列出四十个合成检查项。')];
+let longRecord = 0;
+for (let turn = 1; turn <= 40; turn++) {
+  if (turn > 1) longHistory = [...longHistory, user(`长会话第 ${turn} 轮：继续下一个检查项。`)];
+  const answer = `第 ${turn} 个检查项：${'合成说明文字。'.repeat(20 + (turn % 5) * 15)}`;
+  const id = await add(env(longHistory, [assistant(answer)], 'long-40'));
+  if (turn === 1) longRecord = id;
+  longHistory = [...longHistory, { role: 'assistant', content: answer }];
+}
+const longConversation = store.db
+  .query<{ conversation_id: number }, [number]>('SELECT conversation_id FROM requests WHERE id=?')
+  .get(longRecord)!.conversation_id;
 const first = store.db
   .query<{ conversation_id: number }, [number]>('SELECT conversation_id FROM requests WHERE id=?')
   .get(main)!;
@@ -370,6 +383,7 @@ console.log(
     source: 'synthetic-demo',
     mainConversationId: first.conversation_id,
     mainRecordId: main,
+    longConversationId: longConversation,
     records: sequence,
     scenarios: scenarioRows,
     webSearch: { linkedSearch, unlinkedSearch, searchConsumer },

@@ -17,6 +17,7 @@ import { Message } from '../src/components/Message';
 import { RawDrawer } from '../src/components/RawDrawer';
 import {
   ConversationHeader,
+  JumpControls,
   RequestReader,
   SEARCH_OUTPUT_PATH,
   TurnBlock,
@@ -530,6 +531,7 @@ function renderHeader(conversation: Partial<ConversationRow>) {
           subagentOf: null,
           subagentsPreview: [],
           subagentCount: 0,
+          lastTurnIndex: 2,
         }}
         search={{ c: 3 }}
       />
@@ -862,4 +864,16 @@ test('the request reader shows the missing-source state when its row is gone', a
   } finally {
     client.clear();
   }
+});
+
+test('jump controls are buttons that hide when not useful but stay in the tab order', () => {
+  const html = renderToStaticMarkup(
+    <JumpControls showTop={false} showEnd={true} toTop={() => {}} toEnd={() => {}} />,
+  );
+  expect(html).toContain(
+    '<button type="button" class="jump-button away" title="从第 1 轮开始阅读">↑ 回到开头</button>',
+  );
+  expect(html).toContain(
+    '<button type="button" class="jump-button" title="跳到最新一轮">↓ 最新</button>',
+  );
 });

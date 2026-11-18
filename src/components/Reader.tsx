@@ -21,6 +21,14 @@ import {
   recordViewQuery,
   requestQuery,
 } from '../client/queries';
+import {
+  earlierRanges,
+  earlierStart,
+  initialStart,
+  mainStart,
+  type ReadingStart,
+  useReadingPosition,
+} from '../client/reading';
 import { type AppSearch, validateAppSearch } from '../client/search';
 import { useSentinel } from '../client/sentinel';
 import { modalOpen } from '../client/shortcuts';
@@ -42,8 +50,14 @@ const resetText = {
   no_prefix: '上下文在这里发生了变化（无法和前面的内容对上）',
 } as const;
 
-function useFragments(id: number, startTurn: number | undefined, untilTurn?: number) {
-  const query = useInfiniteQuery(fragmentsQuery(id, startTurn));
+function useFragments(
+  id: number,
+  startTurn: number | undefined,
+  untilTurn?: number,
+  mode: 'at' | 'from' = 'at',
+  enabled = true,
+) {
+  const query = useInfiniteQuery({ ...fragmentsQuery(id, startTurn, mode), enabled });
   const fragments = useMemo(
     () => query.data?.pages.flatMap((page) => page.fragments) ?? [],
     [query.data],
@@ -451,11 +465,136 @@ export function ConversationHeader({
   );
 }
 
+/**
+ * Earlier turns [from, until) loaded above the main stream. Reads pages until a turn at or after
+ * `until` appears (so the last turn here is complete) and reports when it has everything.
+ */
+function EarlierTurns({
+  id,
+  from,
+  until,
+  search,
+  openRaw,
+  spursAt,
+  onDone,
+}: {
+  id: number;
+  from: number;
+  until: number;
+  search: AppSearch;
+  openRaw: (recordId: number, title: string) => void;
+  spursAt: Map<number, { id: number; title: string }[]>;
+  onDone: (from: number, done: boolean) => void;
+}) {
+  const { query, turns, lastSeen } = useFragments(id, from, until - 1, 'from');
+  const { hasNextPage, isFetching, isFetchNextPageError, fetchNextPage } = query;
+  const more = query.data !== undefined && lastSeen < until && hasNextPage;
+  const done = query.data !== undefined && !more;
+  useEffect(() => {
+    if (more && !isFetching && !isFetchNextPageError) void fetchNextPage();
+  }, [more, isFetching, isFetchNextPageError, fetchNextPage]);
+  useEffect(() => onDone(from, done), [from, done, onDone]);
+  if (query.isPending) return <Loading label="正在载入前面的轮次…" />;
+  if (query.isError && !query.data)
+    return <ErrorState error={query.error} retry={() => void query.refetch()} />;
+  return (
+    <>
+      {turns.map((view, index) => (
+        <TurnBlock
+          key={view.turn.turnIndex}
+          view={view}
+          anchored={false}
+          openRaw={openRaw}
+          spurs={spursAt.get(view.turn.turnIndex) ?? []}
+          search={search}
+          streamOpen={more && index === turns.length - 1}
+        />
+      ))}
+      {more && isFetchNextPageError && !isFetching && (
+        <button type="button" className="link small load-more" onClick={() => void fetchNextPage()}>
+          继续载入
+        </button>
+      )}
+    </>
+  );
+}
+
+/** Floating "回到开头" / "最新" controls; hidden ones stay visible while keyboard-focused. */
+export function JumpControls({
+  showTop,
+  showEnd,
+  toTop,
+  toEnd,
+}: {
+  showTop: boolean;
+  showEnd: boolean;
+  toTop: () => void;
+  toEnd: () => void;
+}) {
+  return (
+    <div className="jump">
+      <button
+        type="button"
+        className={`jump-button${showTop ? '' : ' away'}`}
+        title="从第 1 轮开始阅读"
+        onClick={toTop}
+      >
+        ↑ 回到开头
+      </button>
+      <button
+        type="button"
+        className={`jump-button${showEnd ? '' : ' away'}`}
+        title="跳到最新一轮"
+        onClick={toEnd}
+      >
+        ↓ 最新
+      </button>
+    </div>
+  );
+}
+
 export function ConversationReader({ id, search }: { id: number; search: AppSearch }) {
   const detail = useQuery(conversationQuery(id));
-  const [start, setStart] = useState<number | undefined>(search.t);
-  useEffect(() => setStart(search.t), [search.t]);
-  const { query, turns } = useFragments(id, start);
+  // The main stream starts at the anchored turn, at the latest turns, or at turn 1; `earlier`
+  // lists the starts of ranges added above it, newest first.
+  const [view, setView] = useState<{ start: ReadingStart; earlier: number[] }>(() => ({
+    start: initialStart(search.t),
+    earlier: [],
+  }));
+  const [done, setDone] = useState<ReadonlySet<number>>(() => new Set());
+  const reset = useCallback((start: ReadingStart) => {
+    setView({ start, earlier: [] });
+    setDone(new Set());
+  }, []);
+  const [anchorT, setAnchorT] = useState(search.t);
+  if (anchorT !== search.t) {
+    setAnchorT(search.t);
+    reset(initialStart(search.t));
+  }
+  const lastTurnIndex = detail.data?.lastTurnIndex ?? null;
+  const main = mainStart(view.start, lastTurnIndex);
+  const anchor = view.start.kind === 'anchor' ? view.start.turn : undefined;
+  // A refreshed detail can move the tail start; earlier ranges were cut against the old one.
+  const [mainSeen, setMainSeen] = useState(main);
+  if (mainSeen !== main) {
+    setMainSeen(main);
+    if (view.earlier.length > 0) reset(view.start);
+  }
+  const { query, turns } = useFragments(
+    id,
+    main,
+    undefined,
+    anchor === undefined ? 'from' : 'at',
+    // The latest turns are known only from the detail.
+    view.start.kind !== 'tail' || detail.data !== undefined,
+  );
+  const position = useReadingPosition();
+  const { toEnd, toTop, release } = position;
+  // Opening at the latest turns follows the end until the reader scrolls; anchors take over.
+  useEffect(() => {
+    if (view.start.kind === 'tail') toEnd();
+    else if (view.start.kind === 'anchor') release();
+  }, [view.start, toEnd, release]);
   const [raw, setRaw] = useState<{ recordId: number; title: string } | null>(null);
   const openRaw = useCallback((recordId: number, title: string) => setRaw({ recordId, title }), []);
   const closeRaw = useCallback(() => setRaw(null), []);
@@ -467,7 +606,50 @@ export function ConversationReader({ id, search }: { id: number; search: AppSear
     isFetching: query.isFetching,
     failed: query.isFetchNextPageError,
     load: loadNext,
+    root: position.scroller,
   });
+  const lowest = view.earlier.at(-1) ?? main;
+  const atBeginning = lowest <= 1;
+  const earlierBusy = view.earlier.length > 0 && !done.has(lowest);
+  const loadEarlier = useCallback(
+    () =>
+      setView((current) => {
+        const low = current.earlier.at(-1) ?? main;
+        return low <= 1
+          ? current
+          : { ...current, earlier: [...current.earlier, earlierStart(low)] };
+      }),
+    [main],
+  );
+  const onDone = useCallback(
+    (from: number, value: boolean) =>
+      setDone((previous) => {
+        if (previous.has(from) === value) return previous;
+        const next = new Set(previous);
+        if (value) next.add(from);
+        else next.delete(from);
+        return next;
+      }),
+    [],
+  );
+  // Top sentinel: reaching the top loads the previous EARLIER_STEP turns, one range at a time.
+  const top = useSentinel({
+    hasNextPage: query.data !== undefined && !atBeginning,
+    isFetching: earlierBusy,
+    failed: false,
+    load: loadEarlier,
+    root: position.scroller,
+  });
+  const jumpEnd = useCallback(() => {
+    // The end is not loaded (anchored or reading from turn 1): restart at the latest turns.
+    // Already reading the tail: keep earlier ranges; pinning lets the bottom sentinel finish.
+    if (hasNextPage && view.start.kind !== 'tail') reset({ kind: 'tail' });
+    toEnd();
+  }, [hasNextPage, view.start.kind, reset, toEnd]);
+  const jumpTop = useCallback(() => {
+    if (!atBeginning) reset({ kind: 'top' });
+    toTop();
+  }, [atBeginning, reset, toTop]);
   // [ and ] jump between turns outside text inputs.
   useEffect(() => {
     const onKey = (event: KeyboardEvent) => {
@@ -499,37 +681,51 @@ export function ConversationReader({ id, search }: { id: number; search: AppSear
   if (detail.isPending) return <Loading label="正在打开会话…" />;
   if (detail.isError)
     return <ErrorState error={detail.error} retry={() => void detail.refetch()} />;
-  const first = turns[0]?.turn.turnIndex;
+  // Inherited turns precede turn 1; show them only once the beginning is loaded.
+  const beginningLoaded =
+    atBeginning && (view.earlier.length > 0 ? done.has(lowest) : !query.isPending);
   return (
     <>
       <ConversationHeader detail={detail.data} search={search} />
-      <div className="thread">
-        {(!first || first === 1) && (
+      <div className="thread" ref={position.ref}>
+        {!atBeginning && query.data !== undefined && (
+          <div ref={top.ref} className="sentinel top-sentinel">
+            {top.showManual && (
+              <button type="button" className="ghost earlier" onClick={loadEarlier}>
+                载入前面的轮次（从第 {earlierStart(lowest)} 轮开始）
+              </button>
+            )}
+          </div>
+        )}
+        {beginningLoaded && (
           <InheritedTurns detail={detail.data} search={search} openRaw={openRaw} />
         )}
-        {first !== undefined && first > 1 && (
-          <button
-            type="button"
-            className="ghost earlier"
-            onClick={() => setStart(Math.max(1, first - 20))}
-          >
-            载入前面的轮次（从第 {Math.max(1, first - 20)} 轮开始）
-          </button>
-        )}
+        {earlierRanges(main, view.earlier).map((range) => (
+          <EarlierTurns
+            key={range.from}
+            id={id}
+            from={range.from}
+            until={range.until}
+            search={search}
+            openRaw={openRaw}
+            spursAt={spursAt}
+            onDone={onDone}
+          />
+        ))}
         {query.isPending ? (
           <Loading label="正在载入对话内容…" />
         ) : query.isError && !query.data ? (
           <ErrorState error={query.error} retry={() => void query.refetch()} />
-        ) : turns.length === 0 ? (
+        ) : turns.length === 0 && view.earlier.length === 0 ? (
           <EmptyState title="这段会话没有可显示的内容" />
         ) : (
-          turns.map((view, index) => (
+          turns.map((turnView, index) => (
             <TurnBlock
-              key={view.turn.turnIndex}
-              view={view}
-              anchored={search.t === view.turn.turnIndex}
+              key={turnView.turn.turnIndex}
+              view={turnView}
+              anchored={anchor !== undefined && anchor === turnView.turn.turnIndex}
               openRaw={openRaw}
-              spurs={spursAt.get(view.turn.turnIndex) ?? []}
+              spurs={spursAt.get(turnView.turn.turnIndex) ?? []}
               search={search}
               streamOpen={hasNextPage && index === turns.length - 1}
             />
@@ -545,6 +741,12 @@ export function ConversationReader({ id, search }: { id: number; search: AppSear
           {!hasNextPage && turns.length > 0 && <p className="end">会话到这里结束。</p>}
         </div>
       </div>
+      <JumpControls
+        showTop={!position.atTop || !atBeginning}
+        showEnd={!position.atEnd}
+        toTop={jumpTop}
+        toEnd={jumpEnd}
+      />
       {raw && <RawDrawer recordId={raw.recordId} title={raw.title} close={closeRaw} />}
     </>
   );

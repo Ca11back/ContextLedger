@@ -543,6 +543,12 @@ export function conversationDetail(store: Ledger, conversationId: number): Conve
         : { id: row.subagent_of, title: parentTitle, removed: parentTitle === null },
     subagentsPreview: subagents.map((r) => ({ id: r.id, title: r.title, agentName: r.agentName })),
     subagentCount: row.subagent_count,
+    lastTurnIndex:
+      store.db
+        .query<{ last: number | null }, [number]>(
+          'SELECT max(turn_index) AS last FROM requests WHERE conversation_id=?',
+        )
+        .get(conversationId)?.last ?? null,
   };
   while (
     bytes(result) > CONTENT_BUDGET &&
@@ -556,7 +562,10 @@ export function conversationDetail(store: Ledger, conversationId: number): Conve
 }
 function start(store: Ledger, conversationId: number, params: URLSearchParams) {
   existingConversation(store, conversationId);
-  if (params.has('cursor') && params.has('startTurn')) bad();
+  if (params.has('cursor') && (params.has('startTurn') || params.has('fromTurn'))) bad();
+  if (params.has('startTurn') && params.has('fromTurn')) bad();
+  // fromTurn: the first existing turn at or after n (retention can leave gaps); no 404.
+  if (params.has('fromTurn')) return integer(params.get('fromTurn'), 0, 1);
   if (!params.has('startTurn')) return 0;
   const turn = integer(params.get('startTurn'), 0, 1);
   if (
