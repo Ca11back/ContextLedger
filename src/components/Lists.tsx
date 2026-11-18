@@ -1,7 +1,7 @@
 import { useInfiniteQuery } from '@tanstack/react-query';
 import { Link } from '@tanstack/react-router';
 import { useCallback, useEffect } from 'react';
-import { count, shortId, when } from '../client/format';
+import { cost, count, partialChargeNote, shortId, when } from '../client/format';
 import { conversationsQuery, requestsQuery } from '../client/queries';
 import { type AppSearch, hasFilters, validateAppSearch } from '../client/search';
 import { useSentinel } from '../client/sentinel';
@@ -41,6 +41,21 @@ function FilterBar({
   return (
     <fieldset className="filters">
       <legend className="sr-only">筛选</legend>
+      {conversations && (
+        <fieldset className="sort">
+          <legend className="sr-only">排序</legend>
+          <Chip
+            on={search.sort === undefined}
+            label="最近"
+            onClick={() => go({ ...search, sort: undefined })}
+          />
+          <Chip
+            on={search.sort === 'cost'}
+            label="费用"
+            onClick={() => go({ ...search, sort: 'cost' })}
+          />
+        </fieldset>
+      )}
       <Chip
         on={isToday}
         label="今天"
@@ -77,7 +92,9 @@ function FilterBar({
         <button
           type="button"
           className="link small"
-          onClick={() => go({ tab: search.tab, c: search.c, t: search.t, r: search.r })}
+          onClick={() =>
+            go({ tab: search.tab, c: search.c, t: search.t, r: search.r, sort: search.sort })
+          }
         >
           清除筛选
         </button>
@@ -182,6 +199,14 @@ export function ConversationList({ search, go }: { search: AppSearch; go: Naviga
                   <span>{row.models[0] ?? '未知模型'}</span>
                   <span>{row.ownTurns} 轮</span>
                   <span>{when(row.lastAt)}</span>
+                  {cost(row.charge, row.chargeUsd) && (
+                    <span
+                      className="cost"
+                      title={`网关计费，非上游成本${row.chargePartial ? `；${partialChargeNote}` : ''}`}
+                    >
+                      {cost(row.charge, row.chargeUsd)}
+                    </span>
+                  )}
                   {row.subagentOf && (
                     <span className="tag lineage">
                       子代理{row.agentName ? ` · ${row.agentName}` : ''} · 由 #{row.subagentOf.id}{' '}
@@ -266,6 +291,11 @@ export function RequestList({ search, go }: { search: AppSearch; go: Navigate })
                   <span>
                     {count(row.inputTokens)} → {count(row.outputTokens)}
                   </span>
+                  {cost(row.charge, row.chargeUsd) && (
+                    <span className="cost" title="网关计费，非上游成本">
+                      {cost(row.charge, row.chargeUsd)}
+                    </span>
+                  )}
                   <span
                     className={`tag ${row.completeness === 'error' ? 'danger' : row.completeness === 'partial' ? 'warn' : 'quiet'}`}
                   >

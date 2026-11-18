@@ -35,6 +35,11 @@ export interface ConversationRow {
   outputTokens: number | null;
   charge: number | null;
   chargePartial: boolean;
+  /** Cache-read tokens, cache-write tokens, normalized total input, gateway charge in USD; null = unknown. */
+  cacheReadTokens: number | null;
+  cacheWriteTokens: number | null;
+  inputTotalTokens: number | null;
+  chargeUsd: number | null;
   hasError: boolean;
   hasPartial: boolean;
   forkedFrom: { id: number; turn: number } | null;
@@ -77,6 +82,11 @@ export interface TurnSummary {
   contextReset: ContextReset;
   /** Model stop reason as reported (e.g. MAX_TOKENS, SAFETY, length), when known. */
   stopReason?: string | null;
+  /** Cache-read tokens, cache-write tokens, normalized total input, gateway charge in USD; null = unknown. */
+  cacheReadTokens: number | null;
+  cacheWriteTokens: number | null;
+  inputTotalTokens: number | null;
+  chargeUsd: number | null;
   /** Same-conversation turn this request retries (identical input), when it is a retry. */
   retryOf?: number | null;
   /** A later turn in this conversation retried this one with identical input. */
@@ -152,6 +162,11 @@ export interface RequestRow {
   charge: number | null;
   conversationId: number | null;
   turnIndex: number | null;
+  /** Cache-read tokens, cache-write tokens, normalized total input, gateway charge in USD; null = unknown. */
+  cacheReadTokens: number | null;
+  cacheWriteTokens: number | null;
+  inputTotalTokens: number | null;
+  chargeUsd: number | null;
 }
 
 export interface RequestList {

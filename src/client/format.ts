@@ -39,9 +39,58 @@ export function duration(ms: number | null) {
   return ms >= 1000 ? `${(ms / 1000).toFixed(1)} s` : `${Math.round(ms)} ms`;
 }
 
-export function charge(quota: number | null, partial = false) {
-  if (quota === null) return '费用未知';
-  return `${partial ? '至少 ' : ''}${quota.toLocaleString()} quota`;
+/** Gateway charge in quota units; a known value is always a complete total. */
+export function charge(quota: number | null | undefined) {
+  if (quota === null || quota === undefined) return '费用未知';
+  return `${quota.toLocaleString()} quota`;
+}
+
+const usdSmall = new Intl.NumberFormat('en-US', {
+  minimumSignificantDigits: 2,
+  maximumSignificantDigits: 2,
+});
+const usdLarge = new Intl.NumberFormat('en-US', {
+  minimumFractionDigits: 2,
+  maximumFractionDigits: 2,
+});
+
+/** Gateway charge in USD: two decimals from $1, two significant digits below; null = unknown. */
+export function usd(value: number | null | undefined) {
+  if (value === null || value === undefined || !Number.isFinite(value)) return '费用未知';
+  const text =
+    value === 0 ? '0.00' : Math.abs(value) >= 1 ? usdLarge.format(value) : usdSmall.format(value);
+  return `$${text}`;
+}
+
+/**
+ * Cost label: "$0.12 · 12,000 quota" when both units are known, whichever is known otherwise,
+ * null when neither. A known unit is always a complete total (the server nulls incomplete sums).
+ */
+export function cost(quota: number | null | undefined, usdValue: number | null | undefined) {
+  const parts: string[] = [];
+  if (usdValue !== null && usdValue !== undefined && Number.isFinite(usdValue))
+    parts.push(usd(usdValue));
+  if (quota !== null && quota !== undefined) parts.push(charge(quota));
+  return parts.length > 0 ? parts.join(' · ') : null;
+}
+
+/** Muted note beside conversation totals when some own turn's charge is unknown in some unit. */
+export const partialChargeNote = '部分轮次费用未知';
+
+/** Cache hit share as a percentage label; null when either value is unknown or the total is 0. */
+export function hitRate(read: number | null | undefined, total: number | null | undefined) {
+  if (read === null || read === undefined || total === null || total === undefined || total <= 0)
+    return null;
+  const share = Math.min(1, read / total) * 100;
+  if (share > 0 && share < 0.5) return '<1%';
+  return `${Math.round(share)}%`;
+}
+
+/** "缓存命中 142,000（95%）"; null when cache reads are unknown. */
+export function cacheHit(read: number | null | undefined, total: number | null | undefined) {
+  if (read === null || read === undefined) return null;
+  const rate = hitRate(read, total);
+  return `缓存命中 ${read.toLocaleString()}${rate ? `（${rate}）` : ''}`;
 }
 
 /** Middle ellipsis for long ids; the full value stays in title / copy. */

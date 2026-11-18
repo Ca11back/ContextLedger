@@ -19,11 +19,12 @@ import { adminHttp } from './http';
 import { normalizeEnvelope } from './normalize';
 import type { NormalizedMessage } from './normalize/types';
 import { safeEnd, splitsSurrogate } from './record-view';
+import type { Statistics } from './statistics';
 import type { Ledger } from './storage';
 
 const CONTENT_BUDGET = API_RESPONSE_MAX_BYTES - 2048;
 type Args = (string | number | null)[];
-interface RequestDb extends RecordMeta {
+interface RequestDb extends RecordMeta, Statistics {
   protocol: string;
   completeness: Completeness;
   input_tokens: number | null;
@@ -40,7 +41,7 @@ interface RequestDb extends RecordMeta {
   retry_of_turn: number | null;
   superseded: number;
 }
-interface ConversationDb {
+interface ConversationDb extends Statistics {
   id: number;
   title: string;
   first_at: number;
@@ -66,7 +67,7 @@ interface ConversationDb {
   token_label: string | null;
 }
 const requestColumns = `id,received_at,source,host_request_id,model,user_label,token_label,truncated,media,duration_ms,
-  protocol,completeness,input_tokens,output_tokens,charge_quota,conversation_id,turn_index,link_rule,parent_id,
+  protocol,completeness,input_tokens,output_tokens,charge_quota,cache_read_tokens,cache_write_tokens,input_total_tokens,charge_usd,conversation_id,turn_index,link_rule,parent_id,
   context_reset,evidence_count,parent_coverage,stop_reason,retry_of_turn,superseded`;
 const conversationSelect = `SELECT c.*, t.subagent_of, t.agent_name, t.subagent_kind,
   CASE WHEN c.id=t.primary_conversation_id THEN coalesce(t.subagent_count,0) ELSE 0 END AS subagent_count,
@@ -119,6 +120,7 @@ function title(store: Ledger, value: number): string | null {
 }
 function rowView(store: Ledger, row: ConversationDb): ConversationRow {
   return {
+    ...statisticsView(row),
     id: row.id,
     title: cap(row.title, 120),
     user: cap(row.user_label ?? '', 256),
@@ -151,6 +153,7 @@ function rowView(store: Ledger, row: ConversationDb): ConversationRow {
 }
 function turnView(row: RequestDb): TurnSummary {
   return {
+    ...statisticsView(row),
     turnIndex: row.turn_index!,
     recordId: row.id,
     requestId: row.host_request_id,
@@ -172,6 +175,7 @@ function turnView(row: RequestDb): TurnSummary {
 }
 function requestView(row: RequestDb): RequestRow {
   return {
+    ...statisticsView(row),
     recordId: row.id,
     requestId: row.host_request_id,
     receivedAt: row.received_at,
@@ -189,6 +193,14 @@ function requestView(row: RequestDb): RequestRow {
     charge: row.charge_quota,
     conversationId: row.conversation_id,
     turnIndex: row.turn_index,
+  };
+}
+function statisticsView(row: Statistics) {
+  return {
+    cacheReadTokens: row.cache_read_tokens,
+    cacheWriteTokens: row.cache_write_tokens,
+    inputTotalTokens: row.input_total_tokens,
+    chargeUsd: row.charge_usd,
   };
 }
 // Authenticated opaque tokens contain only positions and scope, never evidence. Their signature
@@ -313,18 +325,42 @@ function page<T, R>(
 }
 export function conversations(store: Ledger, params: URLSearchParams): ConversationList {
   const { where, args, scope: filter } = filters(params, true);
-  const scope = `conversations:${filter}`;
+  const sort = params.get('sort') ?? 'recent';
+  if (sort !== 'recent' && sort !== 'cost') bad();
+  // Preserve the existing/default recent scope across upgrades.
+  const scope = sort === 'recent' ? `conversations:${filter}` : `conversations:cost:${filter}`;
   const limit = integer(params.get('limit'), 50, 1, 50);
   if (params.has('cursor')) {
     const pos = decode<unknown>(store, params.get('cursor')!, scope);
-    numbers(pos, 2);
-    existingConversation(store, pos[1]!);
-    where.push('(c.last_at<? OR (c.last_at=? AND c.id<?))');
-    args.push(pos[0]!, pos[0]!, pos[1]!);
+    if (sort === 'cost') {
+      if (
+        !Array.isArray(pos) ||
+        pos.length !== 2 ||
+        (pos[0] !== null && (typeof pos[0] !== 'number' || !Number.isFinite(pos[0]))) ||
+        !Number.isSafeInteger(pos[1]) ||
+        pos[1] < 1
+      )
+        bad('invalid_cursor');
+      existingConversation(store, pos[1]);
+      if (pos[0] === null) {
+        where.push('(c.charge_quota IS NULL AND c.id<?)');
+        args.push(pos[1]);
+      } else {
+        where.push('(c.charge_quota<? OR (c.charge_quota=? AND c.id<?) OR c.charge_quota IS NULL)');
+        args.push(pos[0], pos[0], pos[1]);
+      }
+    } else {
+      numbers(pos, 2);
+      existingConversation(store, pos[1]!);
+      where.push('(c.last_at<? OR (c.last_at=? AND c.id<?))');
+      args.push(pos[0]!, pos[0]!, pos[1]!);
+    }
   }
+  const order =
+    sort === 'cost' ? 'c.charge_quota DESC NULLS LAST,c.id DESC' : 'c.last_at DESC,c.id DESC';
   const rows = store.db
     .query<ConversationDb, Args>(
-      `${conversationSelect} ${where.length ? `WHERE ${where.join(' AND ')}` : ''} ORDER BY c.last_at DESC,c.id DESC LIMIT ?`,
+      `${conversationSelect} ${where.length ? `WHERE ${where.join(' AND ')}` : ''} ORDER BY ${order} LIMIT ?`,
     )
     .all(...args, limit + 1);
   return page(
@@ -333,7 +369,7 @@ export function conversations(store: Ledger, params: URLSearchParams): Conversat
     limit,
     scope,
     (r) => rowView(store, r),
-    (r) => [r.last_at, r.id],
+    (r) => [sort === 'cost' ? r.charge_quota : r.last_at, r.id],
   );
 }
 export function requests(store: Ledger, params: URLSearchParams): RequestList {

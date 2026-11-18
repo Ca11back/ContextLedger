@@ -5,7 +5,13 @@ import { type Envelope, metadata, object, type RecordMeta } from '../contracts';
 import { decodeParts, hash, type Prepared, prepare, verify } from './codec';
 import type { Config } from './config';
 import { LedgerError } from './errors';
-import { backfillConversations, ConversationIndex, installConversationSchema } from './linking';
+import {
+  backfillConversations,
+  backfillStatistics,
+  ConversationIndex,
+  installConversationSchema,
+  SCHEMA_VERSION,
+} from './linking';
 import { normalizeEnvelope } from './normalize';
 
 interface Root extends RecordMeta {
@@ -61,7 +67,7 @@ export class Ledger {
       throw new Error('Database requires WAL mode');
     const version = (this.db.query('PRAGMA user_version').get() as { user_version: number })
       .user_version;
-    if (version !== 0 && version !== 2 && version !== 3 && version !== 4 && version !== 5)
+    if (![0, 2, 3, 4, 5, SCHEMA_VERSION].includes(version))
       throw new Error('Unsupported database format');
     this.db.exec(`CREATE TABLE IF NOT EXISTS requests (
       id INTEGER PRIMARY KEY AUTOINCREMENT, received_at INTEGER NOT NULL, source TEXT NOT NULL, upload_id TEXT NOT NULL,
@@ -89,10 +95,11 @@ export class Ledger {
     try {
       if (version === 2 || version === 3 || version === 4)
         backfillConversations(this.db, (id) => this.restore(id));
+      else if (version === 5) backfillStatistics(this.db, (id) => this.restore(id));
       else if (version === 0)
         this.transaction(() => {
           installConversationSchema(this.db);
-          this.db.exec('PRAGMA user_version=5');
+          this.db.exec(`PRAGMA user_version=${SCHEMA_VERSION}`);
         });
       this.conversations = new ConversationIndex(this.db);
     } catch (error) {
@@ -253,6 +260,7 @@ export class Ledger {
     }
     const indexMeta = {
       ...meta,
+      rawUsage: envelope.report.usage,
       source: envelope.source,
       received_at: options.receivedAt ?? options.now?.() ?? Date.now(),
     };

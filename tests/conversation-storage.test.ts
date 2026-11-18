@@ -8,6 +8,7 @@ import type { Envelope } from '../src/contracts';
 import { hash } from '../src/server/codec';
 import type { Config } from '../src/server/config';
 import { requestIndexColumns } from '../src/server/linking';
+import { statisticColumns } from '../src/server/statistics';
 import { Ledger } from '../src/server/storage';
 
 const stores: Ledger[] = [],
@@ -369,7 +370,7 @@ test('v2 restart backfill verifies evidence, preserves bytes and refs, and publi
   expect(row(restarted, b.id).parent_id).toBe(a.id);
   expect(restarted.restore(a.id)).toEqual(bytes);
   expect(restarted.integrity().mismatches).toBe(0);
-  expect(restarted.db.query('PRAGMA user_version').get()).toEqual({ user_version: 5 });
+  expect(restarted.db.query('PRAGMA user_version').get()).toEqual({ user_version: 6 });
   downgrade(restarted);
   restarted.db.query('UPDATE requests SET body_hash=? WHERE id=?').run('0'.repeat(64), a.id);
   restarted.close();
@@ -611,7 +612,7 @@ for (const oldVersion of [3, 4] as const)
     s.close();
     stores.splice(stores.indexOf(s), 1);
     const reopened = store(c);
-    expect(reopened.db.query('PRAGMA user_version').get()).toEqual({ user_version: 5 });
+    expect(reopened.db.query('PRAGMA user_version').get()).toEqual({ user_version: 6 });
     expect(row(reopened, success.id).conversation_id).toBe(row(reopened, p.id).conversation_id);
     expect(row(reopened, success.id).retry_of).toBe(failed.id);
     expect(reopened.db.query(immutableSQL).all()).toEqual(original);
@@ -623,7 +624,7 @@ for (const oldVersion of [3, 4] as const)
     expect(reopened.db.query(immutableSQL).all()).toEqual(original);
     expect(reopened.integrity().mismatches).toBe(0);
   });
-test('backfill command backs up schema4 before opening and explicitly rebuilds schema5', async () => {
+test('backfill command backs up schema4 before opening and explicitly rebuilds the current schema', async () => {
   const c = config(),
     s = store(c);
   const record = await put(s, [user('backup me')], 'OK', { thread: 'main' });
@@ -631,7 +632,7 @@ test('backfill command backs up schema4 before opening and explicitly rebuilds s
   downgradeV4(s);
   s.close();
   stores.splice(stores.indexOf(s), 1);
-  const destination = join(c.database, '..', 'before-v5.sqlite');
+  const destination = join(c.database, '..', 'before-v6.sqlite');
   const env = {
     ...process.env,
     LEDGER_DATABASE: c.database,
@@ -660,7 +661,7 @@ test('backfill command backs up schema4 before opening and explicitly rebuilds s
     { cwd: process.cwd(), env, encoding: 'utf8' },
   );
   expect(result.status).toBe(0);
-  expect(JSON.parse(result.stdout).schema).toBe(5);
+  expect(JSON.parse(result.stdout).schema).toBe(6);
   const before = new Database(destination, { readonly: true });
   expect(before.query('PRAGMA user_version').get()).toEqual({ user_version: 4 });
   expect(before.query('SELECT body_hash FROM requests WHERE id=?').get(record.id)).toEqual({
@@ -669,7 +670,110 @@ test('backfill command backs up schema4 before opening and explicitly rebuilds s
   before.close();
   const reopened = store(c);
   expect(reopened.restore(record.id)).toEqual(bytes);
-  expect(reopened.db.query('PRAGMA user_version').get()).toEqual({ user_version: 5 });
+  expect(reopened.db.query('PRAGMA user_version').get()).toEqual({ user_version: 6 });
+});
+
+function downgradeV5(s: Ledger) {
+  s.db.exec('DROP INDEX conversations_cost');
+  for (const key of statisticColumns) {
+    s.db.exec(`ALTER TABLE requests DROP COLUMN ${key}`);
+    for (const column of [key, `known_${key}`, `unknown_${key}`])
+      s.db.exec(`ALTER TABLE conversations DROP COLUMN ${column}`);
+  }
+  s.db.exec('PRAGMA user_version=5');
+}
+
+test('schema5 migration backfills projected statistics from evidence with retained turn IDs', async () => {
+  const c = config();
+  const s = store(c);
+  const input = [user(`first ${'x'.repeat(2500)}`)];
+  const a = await put(s, input, 'A', { thread: 'main' });
+  const env = envelope([...input, assistant('A'), user('second')], 'B', { thread: 'main' });
+  env.report.usage = {
+    promptTokens: 45,
+    cacheTokens: 18,
+    cacheWriteTokens: 7,
+    inputTokensTotal: 60,
+  };
+  env.report.cost = { quota: 50000, usd: 0.1 };
+  const bytes = Buffer.from(JSON.stringify(env));
+  const retained = await s.ingest(bytes);
+  s.db.transaction(() => remove(s, a.id)).immediate();
+  const omittedWrites = envelope([user('no writes')], 'C');
+  omittedWrites.report.usage = { promptTokens: 45, cacheTokens: 18 };
+  const zero = await s.ingest(Buffer.from(JSON.stringify(omittedWrites)));
+  const zeroConversation = row(s, zero.id).conversation_id;
+  downgradeV5(s);
+  s.db
+    .query('UPDATE requests SET usage_json=? WHERE id=?')
+    .run('{"promptTokens":45,"cacheTokens":18}', retained.id);
+  const roots = s.db.query('SELECT * FROM requests').all();
+  const threads = s.db.query('SELECT * FROM threads').all();
+  const objects = s.db.query('SELECT * FROM objects ORDER BY hash').all();
+  const before = conv(s, a.conversation_id);
+  expect(before).toMatchObject({ own_turns: 1, next_turn: 3, charge_quota: 50000 });
+  s.close();
+  stores.splice(stores.indexOf(s), 1);
+
+  const reopened = store(c);
+  expect(reopened.db.query('PRAGMA user_version').get()).toEqual({ user_version: 6 });
+  expect(
+    reopened.db.query(`SELECT ${Object.keys(roots[0] as object).join(',')} FROM requests`).all(),
+  ).toEqual(roots);
+  expect(reopened.db.query('SELECT * FROM threads').all()).toEqual(threads);
+  expect(reopened.db.query('SELECT * FROM objects ORDER BY hash').all()).toEqual(objects);
+  expect(reopened.restore(retained.id)).toEqual(bytes);
+  expect(row(reopened, retained.id)).toMatchObject({
+    conversation_id: a.conversation_id,
+    turn_index: 2,
+    cache_read_tokens: 18,
+    cache_write_tokens: 7,
+    input_total_tokens: 60,
+    charge_usd: 0.1,
+  });
+  expect(conv(reopened, a.conversation_id)).toMatchObject({
+    ...before,
+    cache_read_tokens: 18,
+    cache_write_tokens: 7,
+    input_total_tokens: 60,
+    charge_usd: 0.1,
+  });
+  expect(row(reopened, zero.id)).toMatchObject({ cache_read_tokens: 18, cache_write_tokens: 0 });
+  expect(conv(reopened, zeroConversation)).toMatchObject({
+    cache_read_tokens: 18,
+    cache_write_tokens: 0,
+  });
+  expect(reopened.integrity().mismatches).toBe(0);
+  const future = await put(reopened, [user('unmatched new window')], 'C', { thread: 'main' });
+  expect(future).toMatchObject({ conversation_id: a.conversation_id, turn_index: 3 });
+  reopened.rebuildConversations();
+  const rebuilt = row(reopened, zero.id);
+  expect(rebuilt).toMatchObject({ cache_read_tokens: 18, cache_write_tokens: 0 });
+  expect(conv(reopened, rebuilt.conversation_id)).toMatchObject({ cache_write_tokens: 0 });
+});
+
+test('schema5 migration leaves projections and version untouched when evidence fails verification', async () => {
+  const c = config();
+  const s = store(c);
+  await put(s, [user('first')]);
+  const last = await put(s, [user('second')]);
+  downgradeV5(s);
+  s.db.query('UPDATE requests SET body_hash=? WHERE id=?').run('0'.repeat(64), last.id);
+  const before = s.db.query('SELECT * FROM conversations ORDER BY id').all();
+  s.close();
+  stores.splice(stores.indexOf(s), 1);
+
+  expect(() => new Ledger(c)).toThrow();
+  const db = new Database(c.database, { readonly: true });
+  try {
+    expect(db.query('PRAGMA user_version').get()).toEqual({ user_version: 5 });
+    expect(db.query('SELECT * FROM conversations ORDER BY id').all()).toEqual(before);
+    expect(
+      db.query("SELECT 1 FROM pragma_table_info('requests') WHERE name='charge_usd'").get(),
+    ).toBeNull();
+  } finally {
+    db.close();
+  }
 });
 
 test('incremental previous-response input titles use the first new real user text', async () => {
@@ -1052,7 +1156,7 @@ test('completed partial-body output cannot use announced ids to accept an edited
   expect(exact.parent_id).toBe(parent.id);
   expect(s.restore(parent.id)).toEqual(bytes);
 });
-test('v4 corrupt evidence never partially publishes schema5 metadata', async () => {
+test('v4 corrupt evidence never partially publishes newer metadata', async () => {
   const c = config(),
     s = store(c);
   const p = await streamPut(s, [user('base')], announcedEvents('r', 'c'));

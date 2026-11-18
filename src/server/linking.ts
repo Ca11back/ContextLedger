@@ -3,6 +3,9 @@ import type { Envelope } from '../contracts';
 import { object } from '../contracts';
 import { normalizeEnvelope } from './normalize';
 import type { AnnouncedOutputItem, NormalizedRequest } from './normalize/types';
+import { type Statistics, statisticColumns, statistics } from './statistics';
+
+export const SCHEMA_VERSION = 6;
 
 export const requestIndexColumns = {
   user_id: 'TEXT',
@@ -37,6 +40,10 @@ export const requestIndexColumns = {
   input_tokens: 'REAL',
   output_tokens: 'REAL',
   charge_quota: 'REAL',
+  cache_read_tokens: 'REAL',
+  cache_write_tokens: 'REAL',
+  input_total_tokens: 'REAL',
+  charge_usd: 'REAL',
   stop_reason: 'TEXT',
 } as const;
 export const conversationSchema = `
@@ -82,6 +89,21 @@ export function installConversationSchema(db: Database) {
   for (const [column, definition] of Object.entries(requestIndexColumns))
     if (!existing.has(column)) db.exec(`ALTER TABLE requests ADD COLUMN ${column} ${definition}`);
   db.exec(conversationSchema);
+  const conversationColumns = new Set(
+    (db.query('PRAGMA table_info(conversations)').all() as { name: string }[]).map((c) => c.name),
+  );
+  for (const column of statisticColumns) {
+    for (const [name, definition] of [
+      [column, 'REAL'],
+      [`known_${column}`, 'REAL NOT NULL DEFAULT 0'],
+      [`unknown_${column}`, 'INTEGER NOT NULL DEFAULT 0'],
+    ])
+      if (!conversationColumns.has(name))
+        db.exec(`ALTER TABLE conversations ADD COLUMN ${name} ${definition}`);
+  }
+  db.exec(
+    'CREATE INDEX IF NOT EXISTS conversations_cost ON conversations(charge_quota DESC,id DESC)',
+  );
 }
 interface Parent {
   id: number;
@@ -132,6 +154,8 @@ export interface IndexMeta {
   model: string;
   usage_json: string;
   cost_json: string;
+  /** Ephemeral received usage preserves field presence lost by numeric metadata. */
+  rawUsage?: unknown;
 }
 export interface PreparedIndex {
   normalized: NormalizedRequest;
@@ -145,6 +169,7 @@ export interface PreparedIndex {
   inputTokens: number | null;
   outputTokens: number | null;
   charge: number | null;
+  statistics: Statistics;
 }
 const parentColumns =
   'id,source,user_id,token_id,protocol,completeness,evidence_chain,evidence_count,input_count,input_chain,announced_output,announcements_valid,response_id,conversation_id,turn_index,thread_key';
@@ -308,6 +333,11 @@ export class ConversationIndex {
       inputTokens: numeric(usage.promptTokens),
       outputTokens: numeric(usage.completionTokens),
       charge: numeric(cost.quota),
+      statistics: statistics(
+        n.protocol,
+        Object.hasOwn(meta, 'rawUsage') ? meta.rawUsage : usage,
+        cost,
+      ),
     };
   }
   /** Call synchronously in the root transaction immediately after prepare, with no await. */
@@ -494,6 +524,7 @@ export class ConversationIndex {
       input_tokens: prepared.inputTokens,
       output_tokens: prepared.outputTokens,
       charge_quota: prepared.charge,
+      ...prepared.statistics,
       stop_reason: n.stopReason?.slice(0, 128) ?? null,
     };
     this.db
@@ -526,6 +557,7 @@ export class ConversationIndex {
           n.completeness === 'partial' ? 1 : 0,
           conversation.id,
         );
+      this.updateStatistics(conversation.id, prepared.statistics, 1);
       this.db
         .query(
           'INSERT INTO conversation_models VALUES(?,?,1) ON CONFLICT(conversation_id,model) DO UPDATE SET turns=turns+1',
@@ -641,7 +673,8 @@ export class ConversationIndex {
       .get(id)!.n;
     this.db
       .query(`UPDATE conversations SET models=?,more_models=?,charge_quota=CASE WHEN unknown_charge=0 THEN known_charge ELSE NULL END,
-      charge_partial=unknown_charge>0,
+      ${statisticColumns.map((c) => `${c}=CASE WHEN unknown_${c}=0 THEN known_${c} ELSE NULL END`).join(',')},
+      charge_partial=unknown_charge>0 OR unknown_charge_usd>0,
       has_error=coalesce((SELECT completeness='error' FROM requests WHERE conversation_id=? AND id!=? ORDER BY turn_index DESC LIMIT 1),0),
       has_partial=coalesce((SELECT completeness='partial' FROM requests WHERE conversation_id=? AND id!=? ORDER BY turn_index DESC LIMIT 1),0) WHERE id=?`)
       .run(
@@ -651,6 +684,26 @@ export class ConversationIndex {
         excludedId,
         id,
         excludedId,
+        id,
+      );
+  }
+  private updateStatistics(id: number, values: Statistics, direction: 1 | -1) {
+    // own_turns already includes the change. Discard any rounding residue
+    // when a field's last known contribution disappears.
+    this.db
+      .query(
+        `UPDATE conversations SET ${statisticColumns
+          .flatMap((c) => [
+            `known_${c}=CASE WHEN own_turns=unknown_${c}+? THEN 0 ELSE known_${c}+? END`,
+            `unknown_${c}=unknown_${c}+?`,
+          ])
+          .join(',')} WHERE id=?`,
+      )
+      .run(
+        ...statisticColumns.flatMap((c) => {
+          const unknown = values[c] === null ? direction : 0;
+          return [unknown, direction * (values[c] ?? 0), unknown];
+        }),
         id,
       );
   }
@@ -693,7 +746,7 @@ export class ConversationIndex {
   remove(id: number) {
     const row = this.db
       .query<
-        {
+        Statistics & {
           conversation_id: number | null;
           thread_key: string | null;
           model: string;
@@ -729,6 +782,7 @@ export class ConversationIndex {
         row.completeness === 'partial' ? 1 : 0,
         cid,
       );
+    this.updateStatistics(cid, row, -1);
     this.db
       .query('UPDATE conversation_models SET turns=turns-1 WHERE conversation_id=? AND model=?')
       .run(cid, row.model);
@@ -774,7 +828,14 @@ export function backfillConversations(db: Database, restore: (id: number) => Uin
         new TextDecoder('utf-8', { fatal: true }).decode(restore(row.id)),
       ) as Envelope;
       const normalized = normalizeEnvelope(envelope);
+      // New statistics come from verified evidence even when older metadata
+      // projections did not allowlist these fields. Keep legacy projections intact.
       const prepared = index.prepare(normalized, row);
+      prepared.statistics = statistics(
+        normalized.protocol,
+        envelope.report.usage,
+        envelope.report.cost,
+      );
       staged
         .query(
           'INSERT INTO requests(id,received_at,source,model,usage_json,cost_json) VALUES(?,?,?,?,?,?)',
@@ -803,7 +864,65 @@ export function backfillConversations(db: Database, restore: (id: number) => Uin
           ).run(...Object.values(row));
         }
       }
-      db.exec('PRAGMA user_version=5');
+      db.exec(`PRAGMA user_version=${SCHEMA_VERSION}`);
+    }).immediate();
+  } finally {
+    staged.close();
+  }
+}
+
+/** Schema5 already has stable membership. Stage only new statistics, never transcripts. */
+export function backfillStatistics(db: Database, restore: (id: number) => Uint8Array) {
+  const staged = new Database(':memory:');
+  try {
+    staged.exec(`CREATE TABLE requests(id INTEGER PRIMARY KEY,conversation_id INTEGER,
+      ${statisticColumns.map((c) => `${c} REAL`).join(',')});
+      CREATE INDEX requests_conversation ON requests(conversation_id)`);
+    for (const row of db
+      .query<{ id: number; conversation_id: number | null }, []>(
+        'SELECT id,conversation_id FROM requests ORDER BY id',
+      )
+      .iterate()) {
+      const envelope = JSON.parse(
+        new TextDecoder('utf-8', { fatal: true }).decode(restore(row.id)),
+      ) as Envelope;
+      const values = statistics(
+        typeof envelope.context.format === 'string' ? envelope.context.format : '',
+        envelope.report.usage,
+        envelope.report.cost,
+      );
+      staged
+        .query(`INSERT INTO requests VALUES(?,?,${statisticColumns.map(() => '?').join(',')})`)
+        .run(row.id, row.conversation_id, ...statisticColumns.map((c) => values[c]));
+    }
+    // Compute own-turn sums and unknown counts before taking the publication lock.
+    staged.exec(`CREATE TABLE conversations AS SELECT conversation_id AS id,
+      ${statisticColumns
+        .flatMap((c) => [
+          `coalesce(sum(${c}),0) AS known_${c}`,
+          `count(*)-count(${c}) AS unknown_${c}`,
+        ])
+        .join(',')}
+      FROM requests WHERE conversation_id IS NOT NULL GROUP BY conversation_id`);
+    db.transaction(() => {
+      installConversationSchema(db);
+      for (const row of staged
+        .query<Statistics & { id: number }, []>('SELECT * FROM requests')
+        .iterate())
+        db.query(
+          `UPDATE requests SET ${statisticColumns.map((c) => `${c}=?`).join(',')} WHERE id=?`,
+        ).run(...statisticColumns.map((c) => row[c]), row.id);
+      const counters = statisticColumns.flatMap((c) => [`known_${c}`, `unknown_${c}`]);
+      for (const row of staged
+        .query<Record<string, number>, []>('SELECT * FROM conversations')
+        .iterate())
+        db.query(
+          `UPDATE conversations SET ${counters.map((c) => `${c}=?`).join(',')} WHERE id=?`,
+        ).run(...counters.map((c) => row[c]), row.id);
+      db.exec(`UPDATE conversations SET ${statisticColumns
+        .map((c) => `${c}=CASE WHEN unknown_${c}=0 THEN known_${c} ELSE NULL END`)
+        .join(',')},charge_partial=unknown_charge>0 OR unknown_charge_usd>0;
+        PRAGMA user_version=${SCHEMA_VERSION}`);
     }).immediate();
   } finally {
     staged.close();

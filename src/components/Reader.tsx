@@ -1,7 +1,18 @@
 import { useInfiniteQuery, useQuery } from '@tanstack/react-query';
 import { Link } from '@tanstack/react-router';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { charge, clock, count, dateTime, duration, shortId, tokens } from '../client/format';
+import {
+  cacheHit,
+  clock,
+  cost,
+  count,
+  dateTime,
+  duration,
+  hitRate,
+  partialChargeNote,
+  shortId,
+  tokens,
+} from '../client/format';
 import { conversationQuery, fragmentsQuery, recordViewQuery } from '../client/queries';
 import { type AppSearch, validateAppSearch } from '../client/search';
 import { useSentinel } from '../client/sentinel';
@@ -75,6 +86,8 @@ export function TurnBlock({
     turn.durationMs !== null && turn.durationMs >= 60_000
       ? `报错（${Math.round(turn.durationMs / 60_000)} 分钟后中断）`
       : '报错（请求失败）';
+  const turnCost = cost(turn.charge, turn.chargeUsd);
+  const turnCache = cacheHit(turn.cacheReadTokens, turn.inputTotalTokens);
   return (
     <>
       {view.reset && (
@@ -111,6 +124,18 @@ export function TurnBlock({
             </button>
             <span>{tokens(turn.inputTokens, turn.outputTokens)}</span>
             <span>{duration(turn.durationMs)}</span>
+            {turnCost && (
+              <span title="网关计费，非上游成本" className="cost">
+                {turnCost}
+              </span>
+            )}
+            {turnCache && (
+              <span
+                title={`缓存写入 ${count(turn.cacheWriteTokens ?? null)} · 总输入 ${count(turn.inputTotalTokens ?? null)} tokens`}
+              >
+                {turnCache}
+              </span>
+            )}
             {turn.model && <span>{turn.model}</span>}
             {turn.stopReason && <span title="模型给出的停止原因">停止原因 {turn.stopReason}</span>}
             {turn.retryOf ? <span className="tag quiet">重试第 {turn.retryOf} 轮</span> : null}
@@ -288,8 +313,16 @@ function InheritedBody({
   );
 }
 
-function Header({ detail, search }: { detail: ConversationDetail; search: AppSearch }) {
+export function ConversationHeader({
+  detail,
+  search,
+}: {
+  detail: ConversationDetail;
+  search: AppSearch;
+}) {
   const c = detail.conversation;
+  const rate = hitRate(c.cacheReadTokens, c.inputTotalTokens);
+  const totalCost = cost(c.charge, c.chargeUsd);
   return (
     <section className="reader-head">
       <Link
@@ -318,7 +351,21 @@ function Header({ detail, search }: { detail: ConversationDetail; search: AppSea
         <span>
           输入 <b>{count(c.inputTokens)}</b> · 输出 <b>{count(c.outputTokens)}</b> tokens
         </span>
-        <span>{charge(c.charge, c.chargePartial)}</span>
+        {totalCost ? (
+          <span className="cost" title="网关计费，非上游成本">
+            <b>{totalCost}</b> <span className="muted">· 网关计费，非上游成本</span>
+          </span>
+        ) : (
+          <span className="muted">费用未知</span>
+        )}
+        {totalCost && c.chargePartial && <span className="muted">{partialChargeNote}</span>}
+        {(c.cacheReadTokens != null || c.cacheWriteTokens != null) && (
+          <span>
+            缓存读取 <b>{count(c.cacheReadTokens ?? null)}</b> · 写入{' '}
+            <b>{count(c.cacheWriteTokens ?? null)}</b>
+            {rate && ` · 命中率 ${rate}`}
+          </span>
+        )}
         <span>
           {dateTime(c.firstAt)} – {clock(c.lastAt)}
         </span>
@@ -439,7 +486,7 @@ export function ConversationReader({ id, search }: { id: number; search: AppSear
   const first = turns[0]?.turn.turnIndex;
   return (
     <>
-      <Header detail={detail.data} search={search} />
+      <ConversationHeader detail={detail.data} search={search} />
       <div className="thread">
         {(!first || first === 1) && (
           <InheritedTurns detail={detail.data} search={search} openRaw={openRaw} />

@@ -1,16 +1,17 @@
 import { Database } from 'bun:sqlite';
 import { existsSync } from 'node:fs';
 import { loadConfig } from '../src/server/config';
+import { SCHEMA_VERSION } from '../src/server/linking';
 import { Ledger } from '../src/server/storage';
 
 // Before an approved deployment, stop the collector and run this command with
-// --backup <new-path>. The backup is taken BEFORE Ledger opens/migrates schema2/3/4.
-// --rebuild explicitly recomputes an existing schema5 index; conversation/turn ids
+// --backup <new-path>. The backup is taken BEFORE Ledger opens/migrates old schemas.
+// --rebuild explicitly recomputes membership; conversation/turn ids
 // may change. Original request ids, exact evidence, charges and CAS stay intact.
 const args = process.argv.slice(2);
 if (args.includes('--help')) {
   console.log(
-    'bun run scripts/backfill-conversations.ts [--backup <new-path>] [--rebuild]\nStop the collector and back up before deployment. Opening schema2/3/4 migrates to schema5; --rebuild also recomputes schema5 membership. Derived conversation/turn ids may change.',
+    `bun run scripts/backfill-conversations.ts [--backup <new-path>] [--rebuild]\nStop the collector and back up before deployment. Opening schema2/3/4/5 migrates to schema${SCHEMA_VERSION}; schema5 preserves conversation/turn ids. --rebuild recomputes membership and may change derived conversation/turn ids.`,
   );
 } else {
   if (
@@ -38,7 +39,7 @@ if (args.includes('--help')) {
     if (args.includes('--rebuild')) ledger.rebuildConversations();
     console.log(
       JSON.stringify({
-        schema: 5,
+        schema: SCHEMA_VERSION,
         records: ledger.metrics().records,
         conversations: ledger.db.query('SELECT count(*) AS count FROM conversations').get(),
       }),

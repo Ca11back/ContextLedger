@@ -331,6 +331,16 @@ fieldset {
   border-color: var(--ink);
   color: var(--ink);
 }
+.filters .sort {
+  display: inline-flex;
+  gap: 6px;
+  padding-right: 8px;
+  margin-right: 2px;
+  border-right: 1px solid var(--rule);
+}
+.cost {
+  font-variant-numeric: tabular-nums;
+}
 .row {
   display: block;
   width: 100%;

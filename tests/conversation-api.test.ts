@@ -3,7 +3,7 @@ import { existsSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { Envelope } from '../src/contracts';
-import type { Fragment, FragmentPage } from '../src/conversation-contracts';
+import type { ConversationList, Fragment, FragmentPage } from '../src/conversation-contracts';
 import { hash } from '../src/server/codec';
 import type { Config } from '../src/server/config';
 import {
@@ -76,6 +76,11 @@ async function insert(store: Ledger, env = envelope()) {
     )
     .get(id)!;
   return { id, conversation: row.conversation_id!, turn: row.turn_index! };
+}
+function withUsage(env: Envelope, usage: unknown, cost: unknown) {
+  env.report.usage = usage;
+  env.report.cost = cost;
+  return env;
 }
 function bounded(value: unknown) {
   expect(Buffer.byteLength(JSON.stringify(value))).toBeLessThanOrEqual(65536);
@@ -160,6 +165,349 @@ test('every new endpoint authenticates independently and sends no-store on error
   expect(response.status).toBe(200);
   expect(response.headers.get('cache-control')).toBe('no-store');
   bounded(await response.json());
+});
+
+test('gateway report statistics project across Responses, Chat, Claude and Gemini views', async () => {
+  const store = fixture();
+  const cases = [
+    {
+      format: 'openai_responses',
+      request: { input: [{ role: 'user', content: 'Responses input' }] },
+      response: {
+        status: 'completed',
+        output: [
+          { type: 'message', role: 'assistant', content: [{ type: 'output_text', text: 'ok' }] },
+        ],
+      },
+      usage: {
+        promptTokens: 100,
+        completionTokens: 5,
+        inputTokensTotal: 120,
+        cacheTokens: 80,
+        imageCacheTokens: 20,
+        cacheWriteTokens: 30,
+        cacheCreationTokens: 30,
+        cacheCreationTokens12h: 20,
+      },
+      expected: { cacheReadTokens: 80, cacheWriteTokens: 30, inputTotalTokens: 120 },
+    },
+    {
+      format: 'openai',
+      request: { messages: [{ role: 'user', content: 'Chat input' }] },
+      response: {
+        choices: [
+          { index: 0, message: { role: 'assistant', content: 'ok' }, finish_reason: 'stop' },
+        ],
+      },
+      usage: {
+        promptTokens: 100,
+        completionTokens: 5,
+        cacheTokens: 90,
+        cacheCreationTokens: 30,
+        cacheCreationTokens12h: 20,
+      },
+      expected: { cacheReadTokens: 90, cacheWriteTokens: 30, inputTotalTokens: 100 },
+    },
+    {
+      format: 'claude',
+      request: { messages: [{ role: 'user', content: 'Claude input' }] },
+      response: {
+        type: 'message',
+        content: [{ type: 'text', text: 'ok' }],
+        stop_reason: 'end_turn',
+      },
+      usage: {
+        promptTokens: 10,
+        completionTokens: 5,
+        cacheTokens: 80,
+        cacheCreationTokens: 15,
+        cacheCreationTokens5m: 5,
+        cacheCreationTokens1h: 15,
+      },
+      expected: { cacheReadTokens: 80, cacheWriteTokens: 20, inputTotalTokens: 110 },
+    },
+    {
+      format: 'gemini',
+      request: { contents: [{ role: 'user', parts: [{ text: 'Gemini input' }] }] },
+      response: {
+        candidates: [{ content: { role: 'model', parts: [{ text: 'ok' }] }, finishReason: 'STOP' }],
+      },
+      usage: { promptTokens: 100, completionTokens: 5, cacheTokens: 75 },
+      expected: { cacheReadTokens: 75, cacheWriteTokens: 0, inputTotalTokens: 100 },
+    },
+  ];
+  for (const entry of cases) {
+    const env = withUsage(envelope([], [], {}, entry.format), entry.usage, {
+      quota: 75,
+      usd: 0.015,
+    });
+    env.report.request = { body: entry.request };
+    env.report.response = { status: 200, body: entry.response };
+    const inserted = await insert(store, env);
+    const expected = { ...entry.expected, chargeUsd: 0.015, charge: 75 };
+    expect(
+      requests(store, new URLSearchParams()).rows.find((r) => r.recordId === inserted.id),
+    ).toMatchObject(expected);
+    expect(conversationDetail(store, inserted.conversation).conversation).toMatchObject(expected);
+    expect(turns(store, inserted.conversation, new URLSearchParams()).turns[0]).toMatchObject(
+      expected,
+    );
+    const header = collect(store, inserted.conversation).all.find((entry) => entry.type === 'turn');
+    expect(header?.turn).toMatchObject(expected);
+  }
+});
+
+test('OpenAI and Gemini infer zero writes only from valid cache reads with every write field omitted', async () => {
+  const store = fixture();
+  const cases = [
+    { format: 'openai', usage: { cacheTokens: 0 }, write: 0 },
+    { format: 'openai_responses', usage: { cacheTokens: 25 }, write: 0 },
+    { format: 'gemini', usage: { promptTokens: 100 }, write: null },
+    { format: 'openai', usage: null, write: null },
+    { format: 'openai', usage: { cacheTokens: 0, cacheWriteTokens: null }, write: null },
+    {
+      format: 'openai_responses',
+      usage: { cacheTokens: 25, cacheCreationTokens12h: 5 },
+      write: null,
+    },
+    { format: 'gemini', usage: { cacheTokens: '25' }, write: null },
+    { format: 'claude', usage: { cacheTokens: 0 }, write: null },
+  ];
+  for (const { format, usage, write } of cases) {
+    const { id } = await insert(store, withUsage(envelope([], [], {}, format), usage, null));
+    const request = requests(store, new URLSearchParams()).rows.find((row) => row.recordId === id);
+    expect(request?.cacheWriteTokens).toBe(write);
+  }
+});
+
+test('usage preserves explicit zero, missing values and explicit totals from converted records', async () => {
+  const store = fixture();
+  const zero = await insert(
+    store,
+    withUsage(
+      envelope(),
+      { promptTokens: 0, cacheTokens: 0, cacheWriteTokens: 0 },
+      { quota: 0, usd: 0 },
+    ),
+  );
+  const unknown = await insert(
+    store,
+    withUsage(
+      envelope([], [], {}, 'claude'),
+      { promptTokens: 15, cacheTokens: 2, cacheCreationTokens12h: 1 },
+      { quota: 30 },
+    ),
+  );
+  const converted = await insert(
+    store,
+    withUsage(
+      envelope([], [], {}, 'openai'),
+      { promptTokens: 15, cacheTokens: 50, cacheCreationTokens: 10, inputTokensTotal: 75 },
+      null,
+    ),
+  );
+  const missing = await insert(store, withUsage(envelope([], [], {}, 'unknown'), null, null));
+  const invalid = await insert(
+    store,
+    withUsage(
+      envelope(),
+      { promptTokens: -1, cacheTokens: 1.5, cacheWriteTokens: Number.MAX_SAFE_INTEGER + 1 },
+      { usd: '0.01' },
+    ),
+  );
+  const rows = requests(store, new URLSearchParams()).rows;
+  expect(rows.find((r) => r.recordId === zero.id)).toMatchObject({
+    cacheReadTokens: 0,
+    cacheWriteTokens: 0,
+    inputTotalTokens: 0,
+    chargeUsd: 0,
+  });
+  expect(rows.find((r) => r.recordId === unknown.id)).toMatchObject({
+    cacheReadTokens: 2,
+    cacheWriteTokens: null,
+    inputTotalTokens: null,
+    chargeUsd: null,
+  });
+  expect(rows.find((r) => r.recordId === converted.id)).toMatchObject({
+    cacheReadTokens: 50,
+    cacheWriteTokens: 10,
+    inputTotalTokens: 75,
+    chargeUsd: null,
+  });
+  expect(rows.find((r) => r.recordId === missing.id)).toMatchObject({
+    conversationId: null,
+    cacheReadTokens: null,
+    cacheWriteTokens: null,
+    inputTotalTokens: null,
+    chargeUsd: null,
+  });
+  expect(rows.find((r) => r.recordId === invalid.id)).toMatchObject({
+    cacheReadTokens: null,
+    cacheWriteTokens: null,
+    inputTotalTokens: null,
+    chargeUsd: null,
+  });
+});
+
+test('conversation usage totals count failed and superseded own turns and recover after unknown turns expire', async () => {
+  const store = fixture();
+  const user = { role: 'user', content: 'first input' };
+  const assistant = { role: 'assistant', content: 'answer' };
+  const next = { role: 'user', content: 'continue' };
+  const measured = { promptTokens: 20, cacheTokens: 10, cacheWriteTokens: 2 };
+  const root = await insert(store, withUsage(envelope([user]), measured, { quota: 100, usd: 0.1 }));
+  const failure = withUsage(envelope([user, assistant, next]), measured, { quota: 200, usd: 0.2 });
+  failure.report.error = { status: 502 };
+  const fail = await insert(store, failure);
+  const success = await insert(
+    store,
+    withUsage(envelope([user, assistant, next]), measured, { quota: 300, usd: 0.3 }),
+  );
+  const branch = await insert(
+    store,
+    withUsage(envelope([user, assistant, { ...next, content: 'edit' }]), measured, {
+      quota: 400,
+      usd: 0.4,
+    }),
+  );
+  expect(fail.conversation).toBe(root.conversation);
+  expect(success.conversation).toBe(root.conversation);
+  expect(turns(store, root.conversation, new URLSearchParams()).turns[1]).toMatchObject({
+    completeness: 'error',
+    superseded: true,
+  });
+  const branchRow = conversationDetail(store, branch.conversation).conversation;
+  expect(branchRow).toMatchObject({
+    ownTurns: 1,
+    inheritedTurns: 1,
+    cacheReadTokens: 10,
+    cacheWriteTokens: 2,
+    inputTotalTokens: 20,
+    charge: 400,
+    chargeUsd: 0.4,
+    chargePartial: false,
+  });
+
+  const last = await insert(
+    store,
+    withUsage(
+      envelope([user, assistant, next, assistant, { ...next, content: 'third input' }]),
+      { promptTokens: 20 },
+      { quota: 0 },
+    ),
+  );
+  expect(last.conversation).toBe(root.conversation);
+  const partial = conversationDetail(store, root.conversation).conversation;
+  expect(partial).toMatchObject({
+    ownTurns: 4,
+    cacheReadTokens: null,
+    cacheWriteTokens: null,
+    inputTotalTokens: 80,
+    charge: 600,
+    chargeUsd: null,
+    chargePartial: true,
+  });
+  remove(store, last.id);
+  const recovered = conversationDetail(store, root.conversation).conversation;
+  expect(recovered).toMatchObject({
+    ownTurns: 3,
+    cacheReadTokens: 30,
+    cacheWriteTokens: 6,
+    inputTotalTokens: 60,
+    charge: 600,
+    chargePartial: false,
+  });
+  expect(recovered.chargeUsd).toBeCloseTo(0.6);
+  remove(store, root.id);
+  const trimmed = conversationDetail(store, root.conversation).conversation;
+  expect(trimmed).toMatchObject({
+    ownTurns: 2,
+    cacheReadTokens: 20,
+    cacheWriteTokens: 4,
+    inputTotalTokens: 40,
+    charge: 500,
+    chargePartial: false,
+  });
+  expect(trimmed.chargeUsd).toBeCloseTo(0.5);
+});
+
+test('retention clears rounding residue after the last known USD charge is removed', async () => {
+  const store = fixture();
+  const put = (usd: number | null) => {
+    const env = envelope([{ role: 'user', content: crypto.randomUUID() }], undefined, {
+      client_metadata: { 'x-codex-turn-metadata': JSON.stringify({ thread_id: 'retained-usage' }) },
+    });
+    env.report.cost = usd === null ? null : { quota: usd * 500_000, usd };
+    return insert(store, env);
+  };
+  const a = await put(0.1);
+  const b = await put(0.2);
+  const unknown = await put(null);
+  expect(unknown.conversation).toBe(a.conversation);
+  remove(store, a.id);
+  remove(store, b.id);
+  expect(conversationDetail(store, a.conversation).conversation.chargeUsd).toBeNull();
+  const zero = await put(0);
+  expect(zero.conversation).toBe(a.conversation);
+  remove(store, unknown.id);
+  expect(conversationDetail(store, a.conversation).conversation.chargeUsd).toBe(0);
+});
+
+test('cost pages order fractional quota ties, zero and unknown, and scope cursors to sort and filters', async () => {
+  const store = fixture();
+  const put = async (quota: number | null) => {
+    const env = envelope([{ role: 'user', content: crypto.randomUUID() }]);
+    env.report.cost = quota === null ? null : { quota, usd: quota / 500_000 };
+    return (await insert(store, env)).conversation;
+  };
+  const high = await put(20.5);
+  const olderTie = await put(10.5);
+  const oldUnknown = await put(null);
+  const zero = await put(0);
+  const newerTie = await put(10.5);
+  const newUnknown = await put(null);
+  const seen: number[] = [];
+  let cursor: string | null = null;
+  do {
+    const params = new URLSearchParams({ sort: 'cost', limit: '1' });
+    if (cursor) params.set('cursor', cursor);
+    const response = conversationHttp(
+      new Request(`http://local/api/conversations?${params}`, {
+        headers: {
+          authorization: `Basic ${Buffer.from('admin:synthetic-admin-password').toString('base64')}`,
+        },
+      }),
+      store,
+      'conversations',
+    );
+    expect(response.status).toBe(200);
+    const page: ConversationList = await response.json();
+    expect(page.rows).toHaveLength(1);
+    seen.push(page.rows[0]!.id);
+    expect(seen.length).toBeLessThanOrEqual(6);
+    cursor = page.cursor;
+  } while (cursor);
+  expect(seen).toEqual([high, newerTie, olderTie, zero, newUnknown, oldUnknown]);
+  const recent = conversations(store, new URLSearchParams({ limit: '1' }));
+  const cost = conversations(store, new URLSearchParams({ sort: 'cost', limit: '1' }));
+  expect(recent.rows[0]?.id).toBe(newUnknown);
+  error(() => conversations(store, new URLSearchParams({ sort: 'expense' })), 400);
+  error(
+    () => conversations(store, new URLSearchParams({ sort: 'recent', cursor: cost.cursor! })),
+    400,
+  );
+  error(
+    () => conversations(store, new URLSearchParams({ sort: 'cost', cursor: recent.cursor! })),
+    400,
+  );
+  error(
+    () =>
+      conversations(
+        store,
+        new URLSearchParams({ sort: 'cost', user: 'someone', cursor: cost.cursor! }),
+      ),
+    400,
+  );
 });
 
 test('lists preserve zero versus null, filters, activity overlap, opaque scope and deterministic order', async () => {

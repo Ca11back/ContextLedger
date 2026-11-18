@@ -40,6 +40,8 @@ const fields = z.object({
   kind: z.catch(z.optional(z.enum(kindValues)), undefined),
   from: positive,
   to: positive,
+  /** Conversation list order; absent = most recent first. Not a filter. */
+  sort: z.catch(z.optional(z.literal('cost')), undefined),
 });
 
 type Fields = z.output<typeof fields>;
@@ -74,10 +76,13 @@ export function hasFilters(search: AppSearch): boolean {
   return filterKeys.some((key) => search[key] !== undefined);
 }
 
+/** Keys a list endpoint accepts: filters plus (conversations only) the sort order. */
+export type ListKey = FilterKey | 'sort';
+
 export function listParams(
   search: AppSearch,
   cursor: string | null | undefined,
-  keys: readonly FilterKey[],
+  keys: readonly ListKey[],
 ): URLSearchParams {
   const params = new URLSearchParams();
   for (const key of keys) {
@@ -88,5 +93,5 @@ export function listParams(
   return params;
 }
 
-export const conversationFilterKeys = filterKeys;
+export const conversationFilterKeys = [...filterKeys, 'sort'] as const;
 export const requestFilterKeys = ['user', 'token', 'model', 'status', 'from', 'to'] as const;

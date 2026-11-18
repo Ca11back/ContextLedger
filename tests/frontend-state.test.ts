@@ -1,8 +1,13 @@
 import { expect, test } from 'bun:test';
-import { createDashboardQueryClient } from '../src/client/queries';
+import {
+  conversationsQuery,
+  createDashboardQueryClient,
+  requestsQuery,
+} from '../src/client/queries';
 import {
   appSearchSchema,
   conversationFilterKeys,
+  hasFilters,
   listParams,
   requestFilterKeys,
   validateAppSearch,
@@ -78,6 +83,10 @@ test('list parameters carry only the filters each list supports', () => {
 
 const turn = (turnIndex: number, extra: Partial<TurnSummary> = {}): TurnSummary => ({
   turnIndex,
+  cacheReadTokens: null,
+  cacheWriteTokens: null,
+  inputTotalTokens: null,
+  chargeUsd: null,
   recordId: turnIndex,
   requestId: `req-${turnIndex}`,
   receivedAt: turnIndex * 1000,
@@ -178,4 +187,44 @@ test('request-scoped query clients do not share private data', () => {
   expect(second.getQueryData(['metrics'])).toBeUndefined();
   first.clear();
   second.clear();
+});
+
+test('conversation sort is a URL param for the conversation list only', () => {
+  expect(validateAppSearch({ sort: 'cost' })).toEqual({ sort: 'cost' });
+  // Absent means most recent; any other value falls back to absent.
+  expect(validateAppSearch({ sort: 'recent' })).toEqual({});
+  expect(validateAppSearch({ sort: 1 })).toEqual({});
+  const search = validateAppSearch({ sort: 'cost', user: 'u' });
+  expect(listParams(search, null, conversationFilterKeys).get('sort')).toBe('cost');
+  expect(listParams(search, null, requestFilterKeys).has('sort')).toBe(false);
+  // Sorting is not a filter: it never turns on "clear filters" or the filtered empty state.
+  expect(hasFilters(validateAppSearch({ sort: 'cost' }))).toBe(false);
+});
+
+test('list requests carry sort=cost only to the conversation endpoint', async () => {
+  const urls: string[] = [];
+  const original = globalThis.fetch;
+  globalThis.fetch = (async (input: string | URL | Request) => {
+    urls.push(String(input));
+    return new Response(JSON.stringify({ rows: [], cursor: null }), { status: 200 });
+  }) as typeof fetch;
+  const client = createDashboardQueryClient();
+  try {
+    const sorted = validateAppSearch({ sort: 'cost', user: 'u' });
+    await client.fetchInfiniteQuery(conversationsQuery(sorted));
+    await client.fetchInfiniteQuery(requestsQuery(sorted));
+    await client.fetchInfiniteQuery(conversationsQuery(validateAppSearch({ user: 'u' })));
+  } finally {
+    globalThis.fetch = original;
+    client.clear();
+  }
+  expect(urls).toEqual([
+    '/api/conversations?user=u&sort=cost',
+    '/api/requests?user=u',
+    '/api/conversations?user=u',
+  ]);
+  // Distinct sort orders never share a cache entry.
+  expect(conversationsQuery(validateAppSearch({ sort: 'cost' })).queryKey).not.toEqual(
+    conversationsQuery(validateAppSearch({})).queryKey,
+  );
 });
