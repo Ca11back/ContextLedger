@@ -177,7 +177,8 @@ export function chat(
   return {
     input,
     output,
-    terminal: primary?.finished === true,
+    terminal: primary?.finished === true || events.some(({ data }) => data.unparsed === '[DONE]'),
+    invalid: primary?.finished !== true,
     responseId,
     stopReason: primary?.reason,
   };

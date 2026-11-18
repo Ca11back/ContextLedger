@@ -9,20 +9,28 @@ import {
   dateTime,
   duration,
   hitRate,
+  incompleteLabel,
   partialChargeNote,
+  searchOperationsSummary,
   shortId,
   tokens,
 } from '../client/format';
-import { conversationQuery, fragmentsQuery, recordViewQuery } from '../client/queries';
+import {
+  conversationQuery,
+  fragmentsQuery,
+  recordViewQuery,
+  requestQuery,
+} from '../client/queries';
 import { type AppSearch, validateAppSearch } from '../client/search';
 import { useSentinel } from '../client/sentinel';
 import { modalOpen } from '../client/shortcuts';
 import { buildTranscript, type TurnView } from '../client/transcript';
-import type { ConversationDetail } from '../conversation-contracts';
+import type { ConversationDetail, RequestRow } from '../conversation-contracts';
 import { EmptyState, ErrorState, Loading } from './Feedback';
 import { Icon } from './Icon';
 import { LeadingHistory, MessageList } from './Message';
 import { RawBrowser, RawDrawer } from './RawDrawer';
+import { SearchOperations } from './Search';
 
 /** Search state for opening conversation `c` (optionally at turn `t`) from the current view. */
 function openAt(search: AppSearch, c: number, t?: number): AppSearch {
@@ -139,7 +147,9 @@ export function TurnBlock({
             {turn.model && <span>{turn.model}</span>}
             {turn.stopReason && <span title="模型给出的停止原因">停止原因 {turn.stopReason}</span>}
             {turn.retryOf ? <span className="tag quiet">重试第 {turn.retryOf} 轮</span> : null}
-            {turn.completeness === 'partial' && <span className="tag warn">回复不完整</span>}
+            {turn.completeness === 'partial' && (
+              <span className="tag warn">{incompleteLabel(turn.incompleteReason)}</span>
+            )}
             {turn.completeness === 'error' && <span className="tag danger">{errorReason}</span>}
             {turn.superseded && !expanded && <span className="tag quiet">已被下一轮重试取代</span>}
             {foldable && (
@@ -173,9 +183,10 @@ export function TurnBlock({
                   messages={carried}
                   label={view.reset ? '变化后的上下文' : '首条请求携带的历史'}
                   pendingId={pendingId}
+                  search={search}
                 />
               )}
-              <MessageList messages={own} pendingId={pendingId} />
+              <MessageList messages={own} pendingId={pendingId} search={search} />
               {turn.superseded ? (
                 <p className="note">
                   {turn.completeness === 'error'
@@ -366,6 +377,11 @@ export function ConversationHeader({
             {rate && ` · 命中率 ${rate}`}
           </span>
         )}
+        {c.searchCount > 0 && (
+          <span title="费用合计已包含这些搜索请求">
+            含联网搜索 <b>{c.searchCount.toLocaleString()}</b> 次
+          </span>
+        )}
         <span>
           {dateTime(c.firstAt)} – {clock(c.lastAt)}
         </span>
@@ -534,9 +550,102 @@ export function ConversationReader({ id, search }: { id: number; search: AppSear
   );
 }
 
+/** Where a search request stores the text it returned to the model. */
+export const SEARCH_OUTPUT_PATH = ['report', 'response', 'body', 'output'];
+
+type RequestSearch = NonNullable<RequestRow['search']>;
+
+/**
+ * Paged output text of a search request, read through the bounded record view. Shows the text only
+ * when the stored output is a string; anything else stays in the raw browser.
+ */
+export function SearchOutput({ recordId }: { recordId: number }) {
+  const [offsets, setOffsets] = useState<number[]>([0]);
+  const offset = offsets.at(-1) ?? 0;
+  const query = useQuery(recordViewQuery(recordId, SEARCH_OUTPUT_PATH, offset));
+  if (query.isPending) return <Loading label="正在读取搜索输出…" />;
+  if (query.isError || query.data.node.kind !== 'string')
+    return <p className="muted small">没有记录到可读的搜索输出，可查看原始数据。</p>;
+  const view = query.data;
+  const next = view.nextOffset;
+  return (
+    <section className="search-output" aria-label="搜索输出">
+      <h2 className="section-label">搜索返回给模型的文本</h2>
+      <div className="text mono-block">{view.text ?? ''}</div>
+      {(view.offset > 0 || next !== null) && (
+        <div className="raw-pager">
+          <button
+            type="button"
+            className="ghost"
+            disabled={offsets.length < 2}
+            onClick={() => setOffsets((previous) => previous.slice(0, -1))}
+          >
+            上一页
+          </button>
+          <span>
+            {view.offset.toLocaleString()}–{(next ?? view.total).toLocaleString()} /{' '}
+            {view.total.toLocaleString()} 字
+          </span>
+          <button
+            type="button"
+            className="ghost"
+            disabled={next === null}
+            onClick={() => {
+              if (next !== null) setOffsets((previous) => [...previous, next]);
+            }}
+          >
+            下一页
+          </button>
+        </div>
+      )}
+    </section>
+  );
+}
+
+/** Operations, result count and the consuming turn of one search request. */
+export function SearchFacts({ info, search }: { info: RequestSearch; search: AppSearch }) {
+  return (
+    <section className="search-facts" aria-label="搜索操作">
+      <p className="facts">
+        <span>
+          <b>联网搜索</b> · {info.operations.length.toLocaleString()} 项操作
+        </span>
+        {info.resultCount !== null && (
+          <span>
+            <b>{info.resultCount.toLocaleString()}</b> 条结果
+          </span>
+        )}
+      </p>
+      <SearchOperations operations={info.operations} />
+      {info.linked ? (
+        <p className="note">
+          这次搜索的输出被{' '}
+          <Link
+            to="/"
+            activeOptions={{ exact: true }}
+            search={openAt(search, info.linked.conversationId, info.linked.turnIndex)}
+            className="link"
+          >
+            会话 #{info.linked.conversationId} 第 {info.linked.turnIndex} 轮
+          </Link>{' '}
+          的工具结果使用，费用计入该会话。
+        </p>
+      ) : (
+        <p className="note">
+          没有找到唯一使用这次搜索输出的工具结果，所以没有关联到会话，费用也不计入任何会话。
+        </p>
+      )}
+    </section>
+  );
+}
+
 export function RequestReader({ recordId, search }: { recordId: number; search: AppSearch }) {
   const root = useQuery(recordViewQuery(recordId, [], 0));
   const meta = root.data?.meta;
+  const request = useQuery(requestQuery(recordId));
+  const row = request.data;
+  const info = row?.search ?? undefined;
+  const title = info ? searchOperationsSummary(info.operations) : null;
   return (
     <>
       <section className="reader-head">
@@ -548,9 +657,10 @@ export function RequestReader({ recordId, search }: { recordId: number; search: 
         >
           <Icon name="left" size={14} /> 请求列表
         </Link>
-        <h1>{meta ? meta.model || '未知模型' : '单条请求'}</h1>
+        <h1>{title ?? (meta ? meta.model || '未知模型' : '单条请求')}</h1>
         {meta && (
           <p className="facts">
+            {title && <span>{meta.model || '未知模型'}</span>}
             <span>{dateTime(meta.received_at)}</span>
             <span className="mono" title={meta.host_request_id}>
               {shortId(meta.host_request_id || '无请求编号', 10)}
@@ -561,17 +671,38 @@ export function RequestReader({ recordId, search }: { recordId: number; search: 
             <span>
               令牌 <b>{meta.token_label || '未知'}</b>
             </span>
+            {row && cost(row.charge, row.chargeUsd) && (
+              <span className="cost" title="网关计费，非上游成本">
+                {cost(row.charge, row.chargeUsd)}
+              </span>
+            )}
+            {row?.completeness === 'partial' && (
+              <span className="tag warn">{incompleteLabel(row.incompleteReason)}</span>
+            )}
+            {row?.completeness === 'error' && <span className="tag danger">报错</span>}
           </p>
         )}
-        <p className="note">
-          这条请求不是对话格式（例如搜索、图片或音频），不属于任何会话，只能查看原始数据。
-        </p>
+        {info ? (
+          <SearchFacts info={info} search={search} />
+        ) : (
+          row && (
+            <p className="note">
+              这条请求不是对话格式（例如搜索、图片或音频），不属于任何会话，只能查看原始数据。
+            </p>
+          )
+        )}
       </section>
       <div className="thread">
-        {root.isError ? (
+        {request.isError ? (
+          <ErrorState error={request.error} retry={() => void request.refetch()} />
+        ) : root.isError ? (
           <ErrorState error={root.error} retry={() => void root.refetch()} />
         ) : (
-          <RawBrowser recordId={recordId} />
+          <>
+            {info && <SearchOutput recordId={recordId} />}
+            <h2 className="section-label">原始数据</h2>
+            <RawBrowser recordId={recordId} />
+          </>
         )}
       </div>
     </>

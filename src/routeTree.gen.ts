@@ -18,6 +18,7 @@ import { Route as ApiMetricsRouteImport } from './routes/api.metrics'
 import { Route as ApiRequestsRouteImport } from './routes/api.requests'
 import { Route as ApiUploadsRouteImport } from './routes/api.uploads'
 import { Route as ApiConversationsIdRouteImport } from './routes/api.conversations.$id'
+import { Route as ApiRequestsIdRouteImport } from './routes/api.requests.$id'
 import { Route as ApiTextContinuationRouteImport } from './routes/api.text.$continuation'
 import { Route as ApiConversationsIdBranchesRouteImport } from './routes/api.conversations.$id.branches'
 import { Route as ApiConversationsIdFragmentsRouteImport } from './routes/api.conversations.$id.fragments'
@@ -70,6 +71,11 @@ const ApiConversationsIdRoute = ApiConversationsIdRouteImport.update({
   path: '/$id',
   getParentRoute: () => ApiConversationsRoute,
 } as any)
+const ApiRequestsIdRoute = ApiRequestsIdRouteImport.update({
+  id: '/$id',
+  path: '/$id',
+  getParentRoute: () => ApiRequestsRoute,
+} as any)
 const ApiTextContinuationRoute = ApiTextContinuationRouteImport.update({
   id: '/api/text/$continuation',
   path: '/api/text/$continuation',
@@ -111,9 +117,10 @@ export interface FileRoutesByFullPath {
   '/api/ingest': typeof ApiIngestRoute
   '/api/lookup': typeof ApiLookupRoute
   '/api/metrics': typeof ApiMetricsRoute
-  '/api/requests': typeof ApiRequestsRoute
+  '/api/requests': typeof ApiRequestsRouteWithChildren
   '/api/uploads': typeof ApiUploadsRoute
   '/api/conversations/$id': typeof ApiConversationsIdRouteWithChildren
+  '/api/requests/$id': typeof ApiRequestsIdRoute
   '/api/text/$continuation': typeof ApiTextContinuationRoute
   '/api/conversations/$id/branches': typeof ApiConversationsIdBranchesRoute
   '/api/conversations/$id/fragments': typeof ApiConversationsIdFragmentsRoute
@@ -128,9 +135,10 @@ export interface FileRoutesByTo {
   '/api/ingest': typeof ApiIngestRoute
   '/api/lookup': typeof ApiLookupRoute
   '/api/metrics': typeof ApiMetricsRoute
-  '/api/requests': typeof ApiRequestsRoute
+  '/api/requests': typeof ApiRequestsRouteWithChildren
   '/api/uploads': typeof ApiUploadsRoute
   '/api/conversations/$id': typeof ApiConversationsIdRouteWithChildren
+  '/api/requests/$id': typeof ApiRequestsIdRoute
   '/api/text/$continuation': typeof ApiTextContinuationRoute
   '/api/conversations/$id/branches': typeof ApiConversationsIdBranchesRoute
   '/api/conversations/$id/fragments': typeof ApiConversationsIdFragmentsRoute
@@ -146,9 +154,10 @@ export interface FileRoutesById {
   '/api/ingest': typeof ApiIngestRoute
   '/api/lookup': typeof ApiLookupRoute
   '/api/metrics': typeof ApiMetricsRoute
-  '/api/requests': typeof ApiRequestsRoute
+  '/api/requests': typeof ApiRequestsRouteWithChildren
   '/api/uploads': typeof ApiUploadsRoute
   '/api/conversations/$id': typeof ApiConversationsIdRouteWithChildren
+  '/api/requests/$id': typeof ApiRequestsIdRoute
   '/api/text/$continuation': typeof ApiTextContinuationRoute
   '/api/conversations/$id/branches': typeof ApiConversationsIdBranchesRoute
   '/api/conversations/$id/fragments': typeof ApiConversationsIdFragmentsRoute
@@ -168,6 +177,7 @@ export interface FileRouteTypes {
     | '/api/requests'
     | '/api/uploads'
     | '/api/conversations/$id'
+    | '/api/requests/$id'
     | '/api/text/$continuation'
     | '/api/conversations/$id/branches'
     | '/api/conversations/$id/fragments'
@@ -185,6 +195,7 @@ export interface FileRouteTypes {
     | '/api/requests'
     | '/api/uploads'
     | '/api/conversations/$id'
+    | '/api/requests/$id'
     | '/api/text/$continuation'
     | '/api/conversations/$id/branches'
     | '/api/conversations/$id/fragments'
@@ -202,6 +213,7 @@ export interface FileRouteTypes {
     | '/api/requests'
     | '/api/uploads'
     | '/api/conversations/$id'
+    | '/api/requests/$id'
     | '/api/text/$continuation'
     | '/api/conversations/$id/branches'
     | '/api/conversations/$id/fragments'
@@ -217,7 +229,7 @@ export interface RootRouteChildren {
   ApiIngestRoute: typeof ApiIngestRoute
   ApiLookupRoute: typeof ApiLookupRoute
   ApiMetricsRoute: typeof ApiMetricsRoute
-  ApiRequestsRoute: typeof ApiRequestsRoute
+  ApiRequestsRoute: typeof ApiRequestsRouteWithChildren
   ApiUploadsRoute: typeof ApiUploadsRoute
   ApiTextContinuationRoute: typeof ApiTextContinuationRoute
   ApiRecordsIdViewRoute: typeof ApiRecordsIdViewRoute
@@ -287,6 +299,13 @@ declare module '@tanstack/react-router' {
       fullPath: '/api/conversations/$id'
       preLoaderRoute: typeof ApiConversationsIdRouteImport
       parentRoute: typeof ApiConversationsRoute
+    }
+    '/api/requests/$id': {
+      id: '/api/requests/$id'
+      path: '/$id'
+      fullPath: '/api/requests/$id'
+      preLoaderRoute: typeof ApiRequestsIdRouteImport
+      parentRoute: typeof ApiRequestsRoute
     }
     '/api/text/$continuation': {
       id: '/api/text/$continuation'
@@ -361,6 +380,18 @@ const ApiConversationsRouteChildren: ApiConversationsRouteChildren = {
 const ApiConversationsRouteWithChildren =
   ApiConversationsRoute._addFileChildren(ApiConversationsRouteChildren)
 
+interface ApiRequestsRouteChildren {
+  ApiRequestsIdRoute: typeof ApiRequestsIdRoute
+}
+
+const ApiRequestsRouteChildren: ApiRequestsRouteChildren = {
+  ApiRequestsIdRoute: ApiRequestsIdRoute,
+}
+
+const ApiRequestsRouteWithChildren = ApiRequestsRoute._addFileChildren(
+  ApiRequestsRouteChildren,
+)
+
 const rootRouteChildren: RootRouteChildren = {
   IndexRoute: IndexRoute,
   HealthzRoute: HealthzRoute,
@@ -368,7 +399,7 @@ const rootRouteChildren: RootRouteChildren = {
   ApiIngestRoute: ApiIngestRoute,
   ApiLookupRoute: ApiLookupRoute,
   ApiMetricsRoute: ApiMetricsRoute,
-  ApiRequestsRoute: ApiRequestsRoute,
+  ApiRequestsRoute: ApiRequestsRouteWithChildren,
   ApiUploadsRoute: ApiUploadsRoute,
   ApiTextContinuationRoute: ApiTextContinuationRoute,
   ApiRecordsIdViewRoute: ApiRecordsIdViewRoute,

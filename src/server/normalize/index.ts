@@ -1,6 +1,7 @@
 import { type Envelope, object } from '../../contracts';
 import { hash } from '../codec';
 import { identityId, isolationDomain, parseCodexIdentity } from '../identity';
+import { alphaSearch } from './alpha-search';
 import { chat } from './chat';
 import { claude } from './claude';
 import { type AdapterResult, capturedEvents, chainHashes, string } from './common';
@@ -70,11 +71,15 @@ export function normalizeEnvelope(envelope: Envelope): NormalizedRequest {
     case 'gemini':
       adapted = gemini(body, final, events);
       break;
+    case 'openai_alpha_search':
+      adapted = alphaSearch(response);
+      break;
   }
   const failed =
     Number(response.status) >= 400 ||
     Boolean(report.error) ||
     Boolean(final.error) ||
+    (protocol === 'openai_responses' && final.status === 'failed') ||
     events.some(
       ({ type, data }) =>
         type === 'error' ||
@@ -84,7 +89,7 @@ export function normalizeEnvelope(envelope: Envelope): NormalizedRequest {
     );
   const completeness = failed
     ? 'error'
-    : response.truncated === true || !adapted.terminal || adapted.invalid
+    : response.truncated === true || !adapted.terminal || adapted.invalid || adapted.incomplete
       ? 'partial'
       : 'complete';
   const input = adapted.input.map((m, index) => ({ ...m, side: 'input' as const, index }));
@@ -131,6 +136,14 @@ export function normalizeEnvelope(envelope: Envelope): NormalizedRequest {
     tokenId: identityId(object(report.token).id),
     identity,
     completeness,
+    incompleteReason:
+      completeness !== 'partial'
+        ? null
+        : response.truncated === true
+          ? 'truncated'
+          : chatProtocols.has(protocol) && !adapted.terminal
+            ? 'no_terminal'
+            : null,
     announcedOutput: announcementsValid ? (adapted.announcedOutput ?? []) : [],
     announcementsValid,
     input,

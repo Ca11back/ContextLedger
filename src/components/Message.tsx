@@ -2,8 +2,10 @@ import { useQueryClient } from '@tanstack/react-query';
 import { useState } from 'react';
 import { firstLines, lineCount } from '../client/format';
 import { textQuery } from '../client/queries';
+import type { AppSearch } from '../client/search';
 import { appendChunk, type MessageView, type PartView } from '../client/transcript';
 import type { MessageKind, TextChunk } from '../conversation-contracts';
+import { SearchBlock } from './Search';
 
 const kindLabel: Record<MessageKind, string> = {
   system: '系统提示',
@@ -140,7 +142,16 @@ function mediaLabel(label: string) {
  * message received and more pages exist). Otherwise a header without parts means the
  * content never arrived.
  */
-export function Message({ message, pending = false }: { message: MessageView; pending?: boolean }) {
+export function Message({
+  message,
+  pending = false,
+  search = {},
+}: {
+  message: MessageView;
+  pending?: boolean;
+  /** Current URL state, kept by links to linked search requests. */
+  search?: AppSearch;
+}) {
   const label =
     message.kind === 'tool_call' || message.kind === 'tool_result'
       ? `${kindLabel[message.kind]}${message.name ? ` · ${message.name}` : ''}`
@@ -156,6 +167,9 @@ export function Message({ message, pending = false }: { message: MessageView; pe
       {message.media && (
         <span className="media-chip">{mediaLabel(message.media.label)} · 已由网关遮罩</span>
       )}
+      {message.searches?.map((summary) => (
+        <SearchBlock key={summary.recordId} summary={summary} search={search} />
+      ))}
       {message.parts.map((part) => (
         <Part key={part.partIndex} message={message} part={part} />
       ))}
@@ -206,9 +220,11 @@ export function groupMessages(messages: readonly MessageView[], pendingId?: stri
 export function MessageList({
   messages,
   pendingId,
+  search,
 }: {
   messages: readonly MessageView[];
   pendingId?: string;
+  search?: AppSearch;
 }) {
   return (
     <>
@@ -218,6 +234,7 @@ export function MessageList({
             key={run.message.messageId}
             message={run.message}
             pending={run.message.messageId === pendingId}
+            search={search}
           />
         ) : (
           <p className="msg reasoning-run muted small" key={run.key}>
@@ -233,10 +250,12 @@ export function LeadingHistory({
   messages,
   label,
   pendingId,
+  search,
 }: {
   messages: MessageView[];
   label: string;
   pendingId?: string;
+  search?: AppSearch;
 }) {
   const [open, setOpen] = useState(false);
   return (
@@ -249,7 +268,7 @@ export function LeadingHistory({
           {open ? '收起' : '展开'}
         </button>
       </div>
-      {open && <MessageList messages={messages} pendingId={pendingId} />}
+      {open && <MessageList messages={messages} pendingId={pendingId} search={search} />}
     </div>
   );
 }

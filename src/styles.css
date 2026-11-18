@@ -839,3 +839,58 @@ dialog.drawer::backdrop {
     transition: none !important;
   }
 }
+
+/* Codex web search: linked blocks on tool results and the search request reader. */
+.search-block {
+  margin: 4px 0 6px;
+  padding: 8px 12px;
+  border: 1px solid var(--rule);
+  border-left: 3px solid var(--lineage);
+  border-radius: 8px;
+  background: var(--sheet);
+}
+.search-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px 10px;
+  font-size: 13px;
+}
+.search-head .icon {
+  color: var(--lineage-ink);
+}
+.search-ops {
+  list-style: none;
+  margin: 4px 0 0;
+  padding: 0;
+  font-size: 13px;
+}
+.search-ops li {
+  display: flex;
+  gap: 8px;
+  align-items: baseline;
+}
+.search-kind {
+  flex: none;
+  min-width: 2.5em;
+  color: var(--muted);
+  font-size: 12px;
+}
+.search-op-text {
+  overflow-wrap: anywhere;
+  white-space: pre-wrap;
+}
+.search-facts .facts {
+  margin-bottom: 4px;
+}
+.search-output {
+  margin-bottom: 18px;
+  max-width: 760px;
+}
+.section-label {
+  margin: 12px 0 6px;
+  font-size: 12px;
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  color: var(--muted);
+}

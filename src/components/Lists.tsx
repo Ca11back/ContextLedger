@@ -1,7 +1,15 @@
 import { useInfiniteQuery } from '@tanstack/react-query';
 import { Link } from '@tanstack/react-router';
 import { useCallback, useEffect } from 'react';
-import { cost, count, partialChargeNote, shortId, when } from '../client/format';
+import {
+  cost,
+  count,
+  incompleteLabel,
+  partialChargeNote,
+  searchOperationsSummary,
+  shortId,
+  when,
+} from '../client/format';
 import { conversationsQuery, requestsQuery } from '../client/queries';
 import { type AppSearch, hasFilters, validateAppSearch } from '../client/search';
 import { useSentinel } from '../client/sentinel';
@@ -281,9 +289,16 @@ export function RequestList({ search, go }: { search: AppSearch; go: Navigate })
                 className="row request-row"
                 aria-current={search.r === row.recordId ? 'true' : undefined}
               >
-                <span className="row-title mono" title={row.requestId}>
-                  {shortId(row.requestId || '无请求编号', 8)}
-                </span>
+                {row.search ? (
+                  <span className="row-title" title={row.requestId}>
+                    <span className="tag lineage">联网搜索</span>{' '}
+                    {searchOperationsSummary(row.search.operations)}
+                  </span>
+                ) : (
+                  <span className="row-title mono" title={row.requestId}>
+                    {shortId(row.requestId || '无请求编号', 8)}
+                  </span>
+                )}
                 <span className="row-meta">
                   <span>{when(row.receivedAt)}</span>
                   <span>{row.user || '未知用户'}</span>
@@ -299,9 +314,21 @@ export function RequestList({ search, go }: { search: AppSearch; go: Navigate })
                   <span
                     className={`tag ${row.completeness === 'error' ? 'danger' : row.completeness === 'partial' ? 'warn' : 'quiet'}`}
                   >
-                    {completenessLabel[row.completeness]}
+                    {row.completeness === 'partial'
+                      ? incompleteLabel(row.incompleteReason)
+                      : completenessLabel[row.completeness]}
                   </span>
-                  {row.conversationId === null && <span className="tag quiet">不属于会话</span>}
+                  {row.search && row.search.resultCount !== null && (
+                    <span>{row.search.resultCount.toLocaleString()} 条结果</span>
+                  )}
+                  {row.search?.linked ? (
+                    <span className="tag lineage">
+                      会话 #{row.search.linked.conversationId} 第 {row.search.linked.turnIndex}{' '}
+                      轮使用
+                    </span>
+                  ) : (
+                    row.conversationId === null && <span className="tag quiet">不属于会话</span>
+                  )}
                 </span>
               </Link>
             </li>

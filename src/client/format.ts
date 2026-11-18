@@ -111,3 +111,30 @@ export function firstLines(text: string, lines: number) {
   }
   return text;
 }
+
+/** Label for a partial reply; the reason is known only when the capture tells it apart. */
+export function incompleteLabel(reason: 'truncated' | 'no_terminal' | null | undefined) {
+  if (reason === 'truncated') return '回复被截断';
+  if (reason === 'no_terminal') return '回复未正常结束';
+  return '回复不完整';
+}
+
+export const searchKindLabel = {
+  search: '搜索',
+  literature: '论文',
+  image: '图片',
+  open: '打开',
+  click: '点击',
+  find: '查找',
+  other: '其他',
+} as const;
+
+/** One-line summary of web search operations: the first one plus how many follow. */
+export function searchOperationsSummary(
+  operations: readonly { kind: keyof typeof searchKindLabel; text: string }[],
+) {
+  const first = operations[0];
+  if (!first) return '联网搜索';
+  const label = `${searchKindLabel[first.kind] ?? searchKindLabel.other}${first.text ? `「${first.text}」` : ''}`;
+  return operations.length > 1 ? `${label} 等 ${operations.length} 项` : label;
+}

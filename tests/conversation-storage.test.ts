@@ -350,6 +350,7 @@ test('retention preserves primary tombstone numbering, declared origins and incr
   expect(s.db.query('SELECT count(*) AS n FROM conversation_models').get()).toEqual({ n: 0 });
 });
 function downgrade(s: Ledger) {
+  s.db.exec('DROP INDEX requests_search_output');
   s.db.exec(
     'DROP TABLE conversation_models; DROP TABLE threads; DROP TABLE conversations; DROP INDEX requests_evidence; DROP INDEX requests_response; DROP INDEX requests_thread; DROP INDEX requests_session; DROP INDEX requests_parent_thread; DROP INDEX requests_conversation; DROP INDEX requests_parent; DROP INDEX requests_conversation_time; DROP INDEX requests_retry; DROP INDEX requests_parent_eligible; DROP INDEX requests_partial_input;',
   );
@@ -370,7 +371,7 @@ test('v2 restart backfill verifies evidence, preserves bytes and refs, and publi
   expect(row(restarted, b.id).parent_id).toBe(a.id);
   expect(restarted.restore(a.id)).toEqual(bytes);
   expect(restarted.integrity().mismatches).toBe(0);
-  expect(restarted.db.query('PRAGMA user_version').get()).toEqual({ user_version: 6 });
+  expect(restarted.db.query('PRAGMA user_version').get()).toEqual({ user_version: 7 });
   downgrade(restarted);
   restarted.db.query('UPDATE requests SET body_hash=? WHERE id=?').run('0'.repeat(64), a.id);
   restarted.close();
@@ -612,7 +613,7 @@ for (const oldVersion of [3, 4] as const)
     s.close();
     stores.splice(stores.indexOf(s), 1);
     const reopened = store(c);
-    expect(reopened.db.query('PRAGMA user_version').get()).toEqual({ user_version: 6 });
+    expect(reopened.db.query('PRAGMA user_version').get()).toEqual({ user_version: 7 });
     expect(row(reopened, success.id).conversation_id).toBe(row(reopened, p.id).conversation_id);
     expect(row(reopened, success.id).retry_of).toBe(failed.id);
     expect(reopened.db.query(immutableSQL).all()).toEqual(original);
@@ -661,7 +662,7 @@ test('backfill command backs up schema4 before opening and explicitly rebuilds t
     { cwd: process.cwd(), env, encoding: 'utf8' },
   );
   expect(result.status).toBe(0);
-  expect(JSON.parse(result.stdout).schema).toBe(6);
+  expect(JSON.parse(result.stdout).schema).toBe(7);
   const before = new Database(destination, { readonly: true });
   expect(before.query('PRAGMA user_version').get()).toEqual({ user_version: 4 });
   expect(before.query('SELECT body_hash FROM requests WHERE id=?').get(record.id)).toEqual({
@@ -670,10 +671,11 @@ test('backfill command backs up schema4 before opening and explicitly rebuilds t
   before.close();
   const reopened = store(c);
   expect(reopened.restore(record.id)).toEqual(bytes);
-  expect(reopened.db.query('PRAGMA user_version').get()).toEqual({ user_version: 6 });
+  expect(reopened.db.query('PRAGMA user_version').get()).toEqual({ user_version: 7 });
 });
 
 function downgradeV5(s: Ledger) {
+  downgradeV6(s);
   s.db.exec('DROP INDEX conversations_cost');
   for (const key of statisticColumns) {
     s.db.exec(`ALTER TABLE requests DROP COLUMN ${key}`);
@@ -681,6 +683,205 @@ function downgradeV5(s: Ledger) {
       s.db.exec(`ALTER TABLE conversations DROP COLUMN ${column}`);
   }
   s.db.exec('PRAGMA user_version=5');
+}
+
+function downgradeV6(s: Ledger) {
+  s.db.exec('DROP INDEX requests_search_output');
+  for (const table of [
+    'tool_call_origins',
+    'tool_output_candidates',
+    'tool_output_parts',
+    'search_links',
+  ])
+    s.db.exec(`DROP TABLE ${table}`);
+  for (const column of [
+    'incomplete_reason',
+    'search_session_key',
+    'search_output_hash',
+    'search_summary',
+  ])
+    s.db.exec(`ALTER TABLE requests DROP COLUMN ${column}`);
+  for (const column of [
+    'search_count',
+    'search_known_charge',
+    'search_unknown_charge',
+    'search_known_charge_usd',
+    'search_unknown_charge_usd',
+  ])
+    s.db.exec(`ALTER TABLE conversations DROP COLUMN ${column}`);
+  s.db.exec('PRAGMA user_version=6');
+}
+
+for (const version of [5, 6]) {
+  test(`schema${version} projects searches atomically without changing membership, evidence, CAS or receipts`, async () => {
+    const c = config();
+    const s = store(c);
+    const input = [user(`migration ${'x'.repeat(2500)}`)];
+    const call = {
+      type: 'function_call',
+      name: 'web.run',
+      call_id: 'migration-call',
+      arguments: '{}',
+    };
+    const initial = envelope(input, '', { thread: 'migration', session: 'migration-session' });
+    initial.report.response = {
+      status: 200,
+      body: { id: 'migration-parent', status: 'completed', output: [call] },
+    };
+    initial.report.cost = { quota: 2, usd: 0.002 };
+    const first = await s.ingest(Buffer.from(JSON.stringify(initial)));
+    const consumer = envelope(
+      [
+        ...input,
+        call,
+        { type: 'function_call_output', call_id: call.call_id, output: 'migration search output' },
+      ],
+      'done',
+      { thread: 'migration', session: 'migration-session' },
+    );
+    consumer.report.cost = { quota: 3, usd: 0.003 };
+    const consumed = await s.ingest(Buffer.from(JSON.stringify(consumer)));
+    const search = envelope([], '', { format: 'openai_alpha_search' });
+    search.report.request = {
+      body: { id: 'migration-session', commands: { search_query: [{ q: 'migration' }] } },
+    };
+    search.report.response = {
+      status: 200,
+      stream: false,
+      body: { output: 'migration search output', results: [{ title: 'source' }] },
+    };
+    search.report.cost = { quota: 5000, usd: 0.01 };
+    const searched = await s.ingest(Buffer.from(JSON.stringify(search)));
+    const cid = row(s, consumed.id).conversation_id;
+    expect(conv(s, cid)).toMatchObject({
+      own_turns: 2,
+      search_count: 1,
+      charge_quota: 5005,
+      charge_usd: 0.015,
+    });
+    const partial = await put(s, [user('truncated')], '', { partial: true });
+    const noTerminal = envelope([user('missing terminal')]);
+    noTerminal.report.response = { status: 200, events: [] };
+    const interrupted = await s.ingest(Buffer.from(JSON.stringify(noTerminal)));
+    const explicitIncomplete = envelope([user('explicit model stop')]);
+    explicitIncomplete.report.response = {
+      status: 200,
+      body: {
+        id: 'explicit-incomplete',
+        status: 'incomplete',
+        incomplete_details: { reason: 'max_output_tokens' },
+        output: [],
+      },
+    };
+    const incomplete = await s.ingest(Buffer.from(JSON.stringify(explicitIncomplete)));
+    // Old adapters considered this terminal a complete capture and missed the stop reason.
+    s.db
+      .query("UPDATE requests SET completeness='complete',stop_reason=NULL WHERE id=?")
+      .run(incomplete.id);
+    s.db
+      .query('UPDATE conversations SET has_partial=0,partial_turns=0 WHERE id=?')
+      .run(row(s, incomplete.id).conversation_id);
+    const bodies = s.db
+      .query<{ id: number }, []>('SELECT id FROM requests ORDER BY id')
+      .all()
+      .map(({ id }) => ({ id, bytes: s.restore(id) }));
+    if (version === 5) downgradeV5(s);
+    else downgradeV6(s);
+    s.db.query("UPDATE requests SET completeness='partial' WHERE id=?").run(searched.id);
+    const membership = s.db
+      .query(
+        'SELECT id,conversation_id,turn_index,parent_id,parent_coverage,link_rule,retry_of,superseded FROM requests ORDER BY id',
+      )
+      .all();
+    const statuses = s.db
+      .query('SELECT id,completeness FROM requests WHERE conversation_id IS NOT NULL ORDER BY id')
+      .all();
+    const flags = s.db
+      .query(
+        'SELECT id,has_error,has_partial,error_turns,partial_turns FROM conversations ORDER BY id',
+      )
+      .all();
+    const threads = s.db.query('SELECT * FROM threads ORDER BY thread_key').all();
+    const objects = s.db.query('SELECT * FROM objects ORDER BY hash').all();
+    const immutable =
+      'SELECT id,upload_id,body_hash,body_length,usage_json,cost_json,wire_manifest_hash,payload FROM requests ORDER BY id';
+    const roots = s.db.query(immutable).all();
+    const receipts = s.db.query('SELECT * FROM uploads').all();
+    const pins = s.db.query('SELECT * FROM pending_pins').all();
+    s.close();
+    stores.splice(stores.indexOf(s), 1);
+    const reopened = store(c);
+    expect(reopened.db.query('PRAGMA user_version').get()).toEqual({ user_version: 7 });
+    expect(
+      reopened.db
+        .query(
+          'SELECT id,conversation_id,turn_index,parent_id,parent_coverage,link_rule,retry_of,superseded FROM requests ORDER BY id',
+        )
+        .all(),
+    ).toEqual(membership);
+    expect(reopened.db.query('SELECT * FROM threads ORDER BY thread_key').all()).toEqual(threads);
+    expect(
+      reopened.db
+        .query('SELECT id,completeness FROM requests WHERE conversation_id IS NOT NULL ORDER BY id')
+        .all(),
+    ).toEqual(statuses);
+    expect(
+      reopened.db
+        .query(
+          'SELECT id,has_error,has_partial,error_turns,partial_turns FROM conversations ORDER BY id',
+        )
+        .all(),
+    ).toEqual(flags);
+    expect(
+      reopened.db
+        .query('SELECT completeness,stop_reason FROM requests WHERE id=?')
+        .get(incomplete.id),
+    ).toEqual({ completeness: 'complete', stop_reason: 'max_output_tokens' });
+    expect(reopened.db.query('SELECT * FROM objects ORDER BY hash').all()).toEqual(objects);
+    expect(reopened.db.query(immutable).all()).toEqual(roots);
+    expect(reopened.db.query('SELECT * FROM uploads').all()).toEqual(receipts);
+    expect(reopened.db.query('SELECT * FROM pending_pins').all()).toEqual(pins);
+    for (const body of bodies) expect(reopened.restore(body.id)).toEqual(body.bytes);
+    expect(row(reopened, searched.id)).toMatchObject({
+      completeness: 'complete',
+      conversation_id: null,
+    });
+    expect(
+      reopened.db.query('SELECT incomplete_reason FROM requests WHERE id=?').get(partial.id),
+    ).toEqual({ incomplete_reason: 'truncated' });
+    expect(
+      reopened.db.query('SELECT incomplete_reason FROM requests WHERE id=?').get(interrupted.id),
+    ).toEqual({ incomplete_reason: 'no_terminal' });
+    expect(conv(reopened, cid)).toMatchObject({
+      own_turns: 2,
+      next_turn: 3,
+      search_count: 1,
+      charge_quota: 5005,
+      charge_usd: 0.015,
+    });
+    expect(reopened.db.query('SELECT * FROM search_links').get()).toMatchObject({
+      search_record_id: searched.id,
+      consumer_record_id: consumed.id,
+      item_index: 2,
+      part_index: 0,
+      call_id: call.call_id,
+    });
+    expect(reopened.integrity().mismatches).toBe(0);
+    const plan = reopened.db
+      .query(
+        'EXPLAIN QUERY PLAN SELECT id FROM requests WHERE search_session_key=? AND search_output_hash=? LIMIT 2',
+      )
+      .all('session', 'hash');
+    expect(JSON.stringify(plan)).toContain('requests_search_output');
+    reopened.db.transaction(() => remove(reopened, searched.id)).immediate();
+    expect(conv(reopened, cid)).toMatchObject({
+      own_turns: 2,
+      search_count: 0,
+      charge_quota: 5,
+      charge_usd: 0.005,
+    });
+    expect(row(reopened, first.id).turn_index).toBe(1);
+  });
 }
 
 test('schema5 migration backfills projected statistics from evidence with retained turn IDs', async () => {
@@ -716,7 +917,7 @@ test('schema5 migration backfills projected statistics from evidence with retain
   stores.splice(stores.indexOf(s), 1);
 
   const reopened = store(c);
-  expect(reopened.db.query('PRAGMA user_version').get()).toEqual({ user_version: 6 });
+  expect(reopened.db.query('PRAGMA user_version').get()).toEqual({ user_version: 7 });
   expect(
     reopened.db.query(`SELECT ${Object.keys(roots[0] as object).join(',')} FROM requests`).all(),
   ).toEqual(roots);
@@ -752,29 +953,61 @@ test('schema5 migration backfills projected statistics from evidence with retain
   expect(conv(reopened, rebuilt.conversation_id)).toMatchObject({ cache_write_tokens: 0 });
 });
 
-test('schema5 migration leaves projections and version untouched when evidence fails verification', async () => {
+test('schema5 publication failure rolls back columns, search projections, statistics and schema version', async () => {
   const c = config();
   const s = store(c);
-  await put(s, [user('first')]);
-  const last = await put(s, [user('second')]);
+  await put(s, [user('publish first')]);
+  const last = await put(s, [user('publish last')]);
   downgradeV5(s);
-  s.db.query('UPDATE requests SET body_hash=? WHERE id=?').run('0'.repeat(64), last.id);
-  const before = s.db.query('SELECT * FROM conversations ORDER BY id').all();
+  s.db.exec(`CREATE TRIGGER reject_projection BEFORE UPDATE ON requests WHEN NEW.id=${last.id}
+    BEGIN SELECT RAISE(ABORT,'synthetic publication failure'); END`);
+  const roots = s.db.query('SELECT * FROM requests ORDER BY id').all();
+  const conversations = s.db.query('SELECT * FROM conversations ORDER BY id').all();
+  const schema = s.db.query('SELECT * FROM sqlite_master ORDER BY name').all();
   s.close();
   stores.splice(stores.indexOf(s), 1);
-
-  expect(() => new Ledger(c)).toThrow();
+  expect(() => new Ledger(c)).toThrow('synthetic publication failure');
   const db = new Database(c.database, { readonly: true });
   try {
     expect(db.query('PRAGMA user_version').get()).toEqual({ user_version: 5 });
-    expect(db.query('SELECT * FROM conversations ORDER BY id').all()).toEqual(before);
-    expect(
-      db.query("SELECT 1 FROM pragma_table_info('requests') WHERE name='charge_usd'").get(),
-    ).toBeNull();
+    expect(db.query('SELECT * FROM requests ORDER BY id').all()).toEqual(roots);
+    expect(db.query('SELECT * FROM conversations ORDER BY id').all()).toEqual(conversations);
+    expect(db.query('SELECT * FROM sqlite_master ORDER BY name').all()).toEqual(schema);
   } finally {
     db.close();
   }
 });
+
+for (const version of [5, 6])
+  test(`schema${version} migration leaves projections and version untouched when evidence fails verification`, async () => {
+    const c = config();
+    const s = store(c);
+    await put(s, [user('first')]);
+    const last = await put(s, [user('second')]);
+    if (version === 5) downgradeV5(s);
+    else downgradeV6(s);
+    s.db.query('UPDATE requests SET body_hash=? WHERE id=?').run('0'.repeat(64), last.id);
+    const before = s.db.query('SELECT * FROM conversations ORDER BY id').all();
+    const roots = s.db.query('SELECT * FROM requests ORDER BY id').all();
+    s.close();
+    stores.splice(stores.indexOf(s), 1);
+
+    expect(() => new Ledger(c)).toThrow();
+    const db = new Database(c.database, { readonly: true });
+    try {
+      expect(db.query('PRAGMA user_version').get()).toEqual({ user_version: version });
+      expect(db.query('SELECT * FROM conversations ORDER BY id').all()).toEqual(before);
+      expect(db.query('SELECT * FROM requests ORDER BY id').all()).toEqual(roots);
+      expect(
+        db
+          .query("SELECT 1 FROM pragma_table_info('requests') WHERE name='incomplete_reason'")
+          .get(),
+      ).toBeNull();
+      expect(db.query("SELECT 1 FROM sqlite_master WHERE name='search_links'").get()).toBeNull();
+    } finally {
+      db.close();
+    }
+  });
 
 test('incremental previous-response input titles use the first new real user text', async () => {
   const s = store();

@@ -203,8 +203,8 @@ export function claude(
   return {
     input,
     output,
-    terminal: stopped && Boolean(reason) && !invalid,
-    invalid,
+    terminal: stopped,
+    invalid: invalid || (stopped && !reason),
     responseId,
     stopReason: reason,
   };

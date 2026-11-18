@@ -3,15 +3,33 @@ import type { Envelope } from '../contracts';
 import { object } from '../contracts';
 import { normalizeEnvelope } from './normalize';
 import type { AnnouncedOutputItem, NormalizedRequest } from './normalize/types';
+import {
+  projectSearch,
+  type SearchProjection,
+  type SearchToolEvidence,
+  searchToolEvidence,
+} from './search-evidence';
+import {
+  copyRows,
+  publishCharges,
+  SearchIndex,
+  searchConversationColumns,
+  searchSchema,
+  searchTables,
+} from './search-index';
 import { type Statistics, statisticColumns, statistics } from './statistics';
 
-export const SCHEMA_VERSION = 6;
+export const SCHEMA_VERSION = 7;
 
 export const requestIndexColumns = {
   user_id: 'TEXT',
   token_id: 'TEXT',
   protocol: "TEXT NOT NULL DEFAULT ''",
   completeness: "TEXT NOT NULL DEFAULT 'partial'",
+  incomplete_reason: 'TEXT',
+  search_session_key: 'TEXT',
+  search_output_hash: 'TEXT',
+  search_summary: 'TEXT',
   input_count: 'INTEGER NOT NULL DEFAULT 0',
   evidence_count: 'INTEGER NOT NULL DEFAULT 0',
   input_chain: 'TEXT',
@@ -101,6 +119,10 @@ export function installConversationSchema(db: Database) {
       if (!conversationColumns.has(name))
         db.exec(`ALTER TABLE conversations ADD COLUMN ${name} ${definition}`);
   }
+  for (const [name, definition] of Object.entries(searchConversationColumns))
+    if (!conversationColumns.has(name))
+      db.exec(`ALTER TABLE conversations ADD COLUMN ${name} ${definition}`);
+  db.exec(searchSchema);
   db.exec(
     'CREATE INDEX IF NOT EXISTS conversations_cost ON conversations(charge_quota DESC,id DESC)',
   );
@@ -156,6 +178,8 @@ export interface IndexMeta {
   cost_json: string;
   /** Ephemeral received usage preserves field presence lost by numeric metadata. */
   rawUsage?: unknown;
+  searchProjection?: SearchProjection | null;
+  searchEvidence?: SearchToolEvidence;
 }
 export interface PreparedIndex {
   normalized: NormalizedRequest;
@@ -496,6 +520,15 @@ export class ConversationIndex {
       token_id: n.tokenId,
       protocol: n.protocol,
       completeness: n.completeness,
+      incomplete_reason: n.incompleteReason,
+      search_session_key: meta.searchProjection?.sessionKey ?? null,
+      search_output_hash: meta.searchProjection?.outputHash ?? null,
+      search_summary: meta.searchProjection
+        ? JSON.stringify({
+            operations: meta.searchProjection.operations,
+            resultCount: meta.searchProjection.resultCount,
+          })
+        : null,
       input_count: n.inputCount,
       evidence_count: n.evidenceCount,
       input_chain: n.inputChain,
@@ -568,6 +601,13 @@ export class ConversationIndex {
         .query('UPDATE threads SET primary_next_turn=? WHERE primary_conversation_id=?')
         .run(conversation.next_turn + 1, conversation.id);
     }
+    new SearchIndex(this.db).insert(
+      id,
+      n,
+      meta.searchProjection ?? null,
+      meta.searchEvidence ?? { origins: [], parts: [] },
+      parent ? (n.previousResponseId ? 0 : prepared.parentCoverage) : null,
+    );
   }
   private createConversation(
     meta: IndexMeta,
@@ -686,6 +726,7 @@ export class ConversationIndex {
         excludedId,
         id,
       );
+    publishCharges(this.db, id);
   }
   private updateStatistics(id: number, values: Statistics, direction: 1 | -1) {
     // own_turns already includes the change. Discard any rounding residue
@@ -744,6 +785,7 @@ export class ConversationIndex {
   }
   /** Call in root deletion transaction; stable indices and origin ids are never rewritten. */
   remove(id: number) {
+    new SearchIndex(this.db).remove(id);
     const row = this.db
       .query<
         Statistics & {
@@ -830,7 +872,12 @@ export function backfillConversations(db: Database, restore: (id: number) => Uin
       const normalized = normalizeEnvelope(envelope);
       // New statistics come from verified evidence even when older metadata
       // projections did not allowlist these fields. Keep legacy projections intact.
-      const prepared = index.prepare(normalized, row);
+      const meta: IndexMeta = {
+        ...row,
+        searchProjection: projectSearch(envelope, normalized),
+        searchEvidence: searchToolEvidence(envelope, normalized),
+      };
+      const prepared = index.prepare(normalized, meta);
       prepared.statistics = statistics(
         normalized.protocol,
         envelope.report.usage,
@@ -841,11 +888,13 @@ export function backfillConversations(db: Database, restore: (id: number) => Uin
           'INSERT INTO requests(id,received_at,source,model,usage_json,cost_json) VALUES(?,?,?,?,?,?)',
         )
         .run(row.id, row.received_at, row.source, row.model, row.usage_json, row.cost_json);
-      staged.transaction(() => index.insert(row.id, row, prepared)).immediate();
+      staged.transaction(() => index.insert(row.id, meta, prepared)).immediate();
     }
     db.transaction(() => {
       installConversationSchema(db);
-      db.exec('DELETE FROM conversation_models; DELETE FROM threads; DELETE FROM conversations;');
+      db.exec(
+        `${searchTables.map((table) => `DELETE FROM ${table};`).join('')} DELETE FROM conversation_models; DELETE FROM threads; DELETE FROM conversations;`,
+      );
       const cols = Object.keys(requestIndexColumns);
       for (const row of staged
         .query<Record<string, SQLQueryBindings>, []>('SELECT * FROM requests')
@@ -854,7 +903,7 @@ export function backfillConversations(db: Database, restore: (id: number) => Uin
           ...cols.map((c) => row[c]),
           row.id,
         );
-      for (const table of ['conversations', 'threads', 'conversation_models']) {
+      for (const table of ['conversations', 'threads', 'conversation_models', ...searchTables]) {
         for (const row of staged
           .query<Record<string, SQLQueryBindings>, []>(`SELECT * FROM ${table}`)
           .iterate()) {
@@ -871,58 +920,122 @@ export function backfillConversations(db: Database, restore: (id: number) => Uin
   }
 }
 
-/** Schema5 already has stable membership. Stage only new statistics, never transcripts. */
-export function backfillStatistics(db: Database, restore: (id: number) => Uint8Array) {
+/** Schemas5/6 have stable membership. Verify and stage projections without rebuilding it. */
+export function backfillSearches(db: Database, restore: (id: number) => Uint8Array) {
   const staged = new Database(':memory:');
   try {
-    staged.exec(`CREATE TABLE requests(id INTEGER PRIMARY KEY,conversation_id INTEGER,
-      ${statisticColumns.map((c) => `${c} REAL`).join(',')});
-      CREATE INDEX requests_conversation ON requests(conversation_id)`);
+    staged.exec(
+      'CREATE TABLE requests(id INTEGER PRIMARY KEY,received_at INTEGER,source TEXT,model TEXT,usage_json TEXT,cost_json TEXT)',
+    );
+    installConversationSchema(staged);
+    for (const table of ['conversations', 'threads', 'conversation_models'])
+      copyRows(db, staged, table);
+    const existing = new Set(
+      (db.query('PRAGMA table_info(requests)').all() as { name: string }[]).map((c) => c.name),
+    );
+    const preserved = [
+      'id',
+      'received_at',
+      'source',
+      'model',
+      'usage_json',
+      'cost_json',
+      ...Object.keys(requestIndexColumns).filter((c) => existing.has(c)),
+    ];
+    const insert = staged.query(
+      `INSERT INTO requests(${preserved.join(',')}) VALUES(${preserved.map(() => '?').join(',')})`,
+    );
+    const search = new SearchIndex(staged);
+    const projected = [
+      'completeness',
+      'incomplete_reason',
+      'search_session_key',
+      'search_output_hash',
+      'search_summary',
+      'stop_reason',
+      ...statisticColumns,
+    ];
     for (const row of db
-      .query<{ id: number; conversation_id: number | null }, []>(
-        'SELECT id,conversation_id FROM requests ORDER BY id',
+      .query<Record<string, SQLQueryBindings>, []>(
+        `SELECT ${preserved.join(',')} FROM requests ORDER BY received_at,id`,
       )
       .iterate()) {
+      const id = Number(row.id);
       const envelope = JSON.parse(
-        new TextDecoder('utf-8', { fatal: true }).decode(restore(row.id)),
+        new TextDecoder('utf-8', { fatal: true }).decode(restore(id)),
       ) as Envelope;
-      const values = statistics(
-        typeof envelope.context.format === 'string' ? envelope.context.format : '',
-        envelope.report.usage,
-        envelope.report.cost,
-      );
+      const n = normalizeEnvelope(envelope);
+      const projection = projectSearch(envelope, n);
+      const evidence = searchToolEvidence(envelope, n);
+      insert.run(...preserved.map((c) => row[c]));
+      const values = {
+        completeness: n.protocol === 'openai_alpha_search' ? n.completeness : row.completeness,
+        incomplete_reason: n.incompleteReason,
+        search_session_key: projection?.sessionKey ?? null,
+        search_output_hash: projection?.outputHash ?? null,
+        search_summary: projection
+          ? JSON.stringify({
+              operations: projection.operations,
+              resultCount: projection.resultCount,
+            })
+          : null,
+        stop_reason: n.stopReason?.slice(0, 128) ?? row.stop_reason,
+        ...statistics(n.protocol, envelope.report.usage, envelope.report.cost),
+      };
       staged
-        .query(`INSERT INTO requests VALUES(?,?,${statisticColumns.map(() => '?').join(',')})`)
-        .run(row.id, row.conversation_id, ...statisticColumns.map((c) => values[c]));
+        .query(`UPDATE requests SET ${projected.map((c) => `${c}=?`).join(',')} WHERE id=?`)
+        .run(...projected.map((c) => values[c as keyof typeof values]), id);
+      // Stored coverage remains valid after retention removed its source parent.
+      const boundary =
+        row.parent_id !== null && row.context_reset === null
+          ? row.previous_response_id
+            ? 0
+            : Number(row.parent_coverage)
+          : null;
+      search.insert(id, n, projection, evidence, boundary);
     }
-    // Compute own-turn sums and unknown counts before taking the publication lock.
-    staged.exec(`CREATE TABLE conversations AS SELECT conversation_id AS id,
-      ${statisticColumns
-        .flatMap((c) => [
-          `coalesce(sum(${c}),0) AS known_${c}`,
-          `count(*)-count(${c}) AS unknown_${c}`,
-        ])
-        .join(',')}
-      FROM requests WHERE conversation_id IS NOT NULL GROUP BY conversation_id`);
+    const counters = statisticColumns.flatMap((c) => [`known_${c}`, `unknown_${c}`]);
+    for (const row of staged
+      .query<Record<string, number>, []>(`SELECT conversation_id AS id,
+      ${statisticColumns.flatMap((c) => [`coalesce(sum(${c}),0) AS known_${c}`, `count(*)-count(${c}) AS unknown_${c}`]).join(',')}
+      FROM requests WHERE conversation_id IS NOT NULL GROUP BY conversation_id`)
+      .iterate())
+      staged
+        .query(`UPDATE conversations SET ${counters.map((c) => `${c}=?`).join(',')} WHERE id=?`)
+        .run(...counters.map((c) => row[c]), row.id);
+    staged.exec(
+      `UPDATE conversations SET ${statisticColumns.map((c) => `${c}=CASE WHEN unknown_${c}=0 THEN known_${c} ELSE NULL END`).join(',')}`,
+    );
+    for (const row of staged.query<{ id: number }, []>('SELECT id FROM conversations').iterate())
+      publishCharges(staged, row.id);
+    const conversationColumns = [
+      ...statisticColumns,
+      ...counters,
+      ...Object.keys(searchConversationColumns),
+      'charge_quota',
+      'known_charge',
+      'charge_partial',
+    ];
     db.transaction(() => {
       installConversationSchema(db);
       for (const row of staged
-        .query<Statistics & { id: number }, []>('SELECT * FROM requests')
+        .query<Record<string, SQLQueryBindings>, []>('SELECT * FROM requests')
         .iterate())
-        db.query(
-          `UPDATE requests SET ${statisticColumns.map((c) => `${c}=?`).join(',')} WHERE id=?`,
-        ).run(...statisticColumns.map((c) => row[c]), row.id);
-      const counters = statisticColumns.flatMap((c) => [`known_${c}`, `unknown_${c}`]);
+        db.query(`UPDATE requests SET ${projected.map((c) => `${c}=?`).join(',')} WHERE id=?`).run(
+          ...projected.map((c) => row[c]),
+          row.id,
+        );
+      for (const table of searchTables) {
+        db.exec(`DELETE FROM ${table}`);
+        copyRows(staged, db, table);
+      }
       for (const row of staged
-        .query<Record<string, number>, []>('SELECT * FROM conversations')
+        .query<Record<string, SQLQueryBindings>, []>('SELECT * FROM conversations')
         .iterate())
         db.query(
-          `UPDATE conversations SET ${counters.map((c) => `${c}=?`).join(',')} WHERE id=?`,
-        ).run(...counters.map((c) => row[c]), row.id);
-      db.exec(`UPDATE conversations SET ${statisticColumns
-        .map((c) => `${c}=CASE WHEN unknown_${c}=0 THEN known_${c} ELSE NULL END`)
-        .join(',')},charge_partial=unknown_charge>0 OR unknown_charge_usd>0;
-        PRAGMA user_version=${SCHEMA_VERSION}`);
+          `UPDATE conversations SET ${conversationColumns.map((c) => `${c}=?`).join(',')} WHERE id=?`,
+        ).run(...conversationColumns.map((c) => row[c]), row.id);
+      db.exec(`PRAGMA user_version=${SCHEMA_VERSION}`);
     }).immediate();
   } finally {
     staged.close();

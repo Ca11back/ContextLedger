@@ -1,3 +1,4 @@
+import type { IncompleteReason } from '../../conversation-contracts';
 import type { DeclaredIdentity, IsolationDomain } from '../identity';
 
 export type MessageKind =
@@ -57,6 +58,7 @@ export interface NormalizedRequest {
   tokenId: string | null;
   identity: DeclaredIdentity | null;
   completeness: Completeness;
+  incompleteReason: IncompleteReason;
   announcedOutput: AnnouncedOutputItem[];
   announcementsValid: boolean;
   input: NormalizedMessage[];

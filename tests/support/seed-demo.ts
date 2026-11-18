@@ -158,9 +158,31 @@ const failed = env([user('这条请求演示错误状态。')], [assistant('错�
 (failed.report.response as Record<string, unknown>).status = 500;
 failed.report.error = { message: 'synthetic error' };
 await add(failed);
-const unknown = env([user('非对话请求')], []);
-unknown.context.format = 'openai_alpha_search';
-await add(unknown);
+function search(output: string) {
+  const entry = env([], []);
+  entry.context.format = 'openai_alpha_search';
+  entry.context.path = '/v1/alpha/search';
+  entry.report.request = {
+    body: {
+      id: 'demo-session',
+      commands: {
+        search_query: [{ q: '合成演示文档' }],
+        open: [{ ref_id: 'https://example.invalid/search-demo' }],
+        response_length: 'short',
+      },
+    },
+  };
+  entry.report.response = {
+    status: 200,
+    stream: false,
+    truncated: false,
+    body: { output, results: [{ title: '合成演示文档' }] },
+  };
+  entry.report.usage = { promptTokens: 0, completionTokens: 0, cacheTokens: 0 };
+  entry.report.cost = { quota: 5_000, usd: 0.01 };
+  return entry;
+}
+const unlinkedSearch = await add(search('这是独立搜索的合成结果，后续请求未消费这段文本。'));
 // Retry cases share a real parent, so only the edited input occupies a branch.
 const retryRootInput = [user('重试演示：请先确认交付目标。')];
 const retryRootReply = '交付目标已确认，可以开始实现。';
@@ -265,6 +287,35 @@ const lateFillUser = await add(
     'title-late-fill-demo',
   ),
 );
+const searchInput = [user('请用联网搜索核对合成演示文档。')];
+const searchCall = {
+  type: 'custom_tool_call',
+  name: 'exec',
+  call_id: 'demo-search-exec',
+  input:
+    'const result = await tools.web.run({search_query: [{q: "合成演示文档"}]}); console.log(result);',
+};
+await add(env(searchInput, [searchCall], 'web-search-demo'));
+const searchOutput = '合成搜索结果显示，交付计划分为范围确认、实施验证和发布验收三个阶段。';
+const linkedSearch = await add(search(searchOutput));
+const searchConsumer = await add(
+  env(
+    [
+      ...searchInput,
+      searchCall,
+      {
+        type: 'custom_tool_call_output',
+        call_id: searchCall.call_id,
+        output: [
+          { type: 'input_text', text: 'Script completed\nOutput:\n' },
+          { type: 'input_text', text: searchOutput },
+        ],
+      },
+    ],
+    [assistant('已核对合成演示文档，三个阶段与交付计划一致。')],
+    'web-search-demo',
+  ),
+);
 const scenarios = {
   retryRoot,
   retryFirstError,
@@ -279,6 +330,7 @@ const scenarios = {
   fallbackBranch,
   lateFillFirst,
   lateFillUser,
+  searchConsumer,
 };
 const scenarioRows = Object.fromEntries(
   Object.entries(scenarios).map(([name, recordId]) => {
@@ -320,6 +372,7 @@ console.log(
     mainRecordId: main,
     records: sequence,
     scenarios: scenarioRows,
+    webSearch: { linkedSearch, unlinkedSearch, searchConsumer },
     adminUser: 'demo',
     adminPassword: 'synthetic-demo-password',
     ingestToken: 'synthetic-demo-ingest-token',

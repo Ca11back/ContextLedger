@@ -11,7 +11,7 @@ import { Ledger } from '../src/server/storage';
 const args = process.argv.slice(2);
 if (args.includes('--help')) {
   console.log(
-    `bun run scripts/backfill-conversations.ts [--backup <new-path>] [--rebuild]\nStop the collector and back up before deployment. Opening schema2/3/4/5 migrates to schema${SCHEMA_VERSION}; schema5 preserves conversation/turn ids. --rebuild recomputes membership and may change derived conversation/turn ids.`,
+    `bun run scripts/backfill-conversations.ts [--backup <new-path>] [--rebuild]\nStop the collector and back up before deployment. Opening schema2/3/4/5/6 migrates to schema${SCHEMA_VERSION}; schema5/6 preserves conversation/turn ids. --rebuild recomputes membership and may change derived conversation/turn ids.`,
   );
 } else {
   if (

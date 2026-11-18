@@ -2,15 +2,27 @@ import { expect, test } from 'bun:test';
 import { QueryClientProvider } from '@tanstack/react-query';
 import { renderToStaticMarkup } from 'react-dom/server';
 import { cacheHit, charge, cost, hitRate, usd } from '../src/client/format';
-import { conversationsQuery, createDashboardQueryClient } from '../src/client/queries';
+import {
+  conversationsQuery,
+  createDashboardQueryClient,
+  recordViewQuery,
+  requestQuery,
+  requestsQuery,
+} from '../src/client/queries';
 import type { AppSearch } from '../src/client/search';
 import type { MessageView } from '../src/client/transcript';
 import { CaughtError } from '../src/components/Feedback';
-import { ConversationList } from '../src/components/Lists';
+import { ConversationList, RequestList } from '../src/components/Lists';
 import { Message } from '../src/components/Message';
 import { RawDrawer } from '../src/components/RawDrawer';
-import { ConversationHeader, TurnBlock } from '../src/components/Reader';
-import type { ConversationRow, TurnSummary } from '../src/conversation-contracts';
+import {
+  ConversationHeader,
+  RequestReader,
+  SEARCH_OUTPUT_PATH,
+  TurnBlock,
+} from '../src/components/Reader';
+import type { ConversationRow, RequestRow, TurnSummary } from '../src/conversation-contracts';
+import type { RecordView } from '../src/view-contracts';
 import { WithRouter } from './support/router';
 
 function render(message: MessageView) {
@@ -112,6 +124,7 @@ test('superseded attempts are dimmed with a retry note and retries are labelled'
     charge: null,
     durationMs: null,
     completeness: 'complete',
+    incompleteReason: null,
     linkRule: 'prefix',
     parentOutputIncomplete: false,
     contextReset: null,
@@ -185,6 +198,7 @@ test('only the last message of an open stream is still loading', () => {
     charge: null,
     durationMs: null,
     completeness: 'complete',
+    incompleteReason: null,
     linkRule: null,
     parentOutputIncomplete: false,
     contextReset: null,
@@ -237,6 +251,7 @@ function summaryOf(extra: Partial<TurnSummary>): TurnSummary {
     charge: null,
     durationMs: null,
     completeness: 'complete',
+    incompleteReason: null,
     linkRule: 'prefix',
     parentOutputIncomplete: false,
     contextReset: null,
@@ -497,6 +512,7 @@ function rowOf(conversation: Partial<ConversationRow>): ConversationRow {
     agentName: null,
     subagentKind: null,
     subagentCount: 0,
+    searchCount: 0,
     ...conversation,
   };
 }
@@ -590,4 +606,260 @@ test('conversation list rows show both cost units and the sort toggle follows th
   const byCost = renderConversationList({ sort: 'cost' }, rows);
   expect(byCost).toContain('aria-pressed="false">最近</button>');
   expect(byCost).toContain('aria-pressed="true">费用</button>');
+});
+
+const searchOps = [
+  { kind: 'search' as const, text: '<b>bun sqlite</b> wal' },
+  { kind: 'open' as const, text: 'https://example.com/a?x=<y>' },
+  { kind: 'find' as const, text: 'checkpoint' },
+];
+
+test('tool results with linked searches show one search block each and keep other parts', () => {
+  const tool: MessageView = {
+    ...base,
+    messageId: 'tool',
+    kind: 'tool_result',
+    name: 'exec',
+    searches: [
+      { recordId: 41, operations: searchOps, resultCount: 7 },
+      { recordId: 42, operations: [{ kind: 'image', text: 'cats' }], resultCount: null },
+    ],
+    parts: [
+      { partIndex: 0, partKind: 'text', partTotal: 9, text: 'exit 0 ok', continuation: null },
+    ],
+  };
+  const html = renderTurnView(summaryOf({}), [tool]);
+  expect(html.split('<strong>联网搜索</strong>').length - 1).toBe(2);
+  expect(html).toContain('7 条结果');
+  expect(html.split('条结果').length - 1).toBe(1);
+  expect(html).toContain('>搜索</span>');
+  expect(html).toContain('>打开</span>');
+  expect(html).toContain('>查找</span>');
+  expect(html).toContain('>图片</span>');
+  // Operation text is escaped and URLs are plain text, never links or fetched resources.
+  expect(html).toContain('&lt;b&gt;bun sqlite&lt;/b&gt; wal');
+  expect(html).toContain('https://example.com/a?x=&lt;y&gt;');
+  expect(html).not.toContain('href="https://example.com');
+  expect(html).not.toContain('<b>bun');
+  // Links open the search request in the request reader, keeping filters.
+  expect(html).toContain('href="/?tab=requests&amp;r=41&amp;user=alice">查看搜索请求</a>');
+  expect(html).toContain('href="/?tab=requests&amp;r=42&amp;user=alice">查看搜索请求</a>');
+  expect(html).toContain('exit 0 ok');
+});
+
+test('partial turns name the incomplete reason when it is known', () => {
+  expect(renderTurnView(summaryOf({ completeness: 'partial' }), [reply])).toContain(
+    '>回复不完整</span>',
+  );
+  expect(
+    renderTurnView(summaryOf({ completeness: 'partial', incompleteReason: 'truncated' }), [reply]),
+  ).toContain('>回复被截断</span>');
+  const noTerminal = renderTurnView(
+    summaryOf({ completeness: 'partial', incompleteReason: 'no_terminal', stopReason: 'length' }),
+    [reply],
+  );
+  expect(noTerminal).toContain('>回复未正常结束</span>');
+  expect(noTerminal).toContain('停止原因 length');
+  expect(noTerminal).not.toContain('>回复不完整</span>');
+});
+
+test('conversation header counts attached web searches only when there are some', () => {
+  expect(renderHeader({ searchCount: 3 })).toContain('含联网搜索 <b>3</b> 次');
+  expect(renderHeader({ searchCount: 0 })).not.toContain('联网搜索');
+  expect(renderHeader({})).not.toContain('联网搜索');
+});
+
+function requestRow(extra: Partial<RequestRow>): RequestRow {
+  return {
+    recordId: 41,
+    requestId: 'req-search',
+    receivedAt: 0,
+    source: 's',
+    user: 'u',
+    token: 'k',
+    model: 'gpt-search',
+    protocol: 'openai_alpha_search',
+    completeness: 'complete',
+    truncated: false,
+    media: false,
+    durationMs: null,
+    inputTokens: null,
+    outputTokens: null,
+    charge: 5000,
+    conversationId: null,
+    turnIndex: null,
+    cacheReadTokens: null,
+    cacheWriteTokens: null,
+    inputTotalTokens: null,
+    chargeUsd: 0.01,
+    incompleteReason: null,
+    search: null,
+    ...extra,
+  };
+}
+
+const searchRow = requestRow({
+  search: { operations: searchOps, resultCount: 7, linked: { conversationId: 5, turnIndex: 12 } },
+});
+
+test('request rows summarise searches and name incomplete reasons', () => {
+  const search: AppSearch = { tab: 'requests' };
+  const client = createDashboardQueryClient();
+  client.setQueryData(requestsQuery(search).queryKey, {
+    pages: [
+      {
+        rows: [
+          searchRow,
+          requestRow({
+            recordId: 50,
+            requestId: 'req-cut',
+            completeness: 'partial',
+            incompleteReason: 'truncated',
+          }),
+          requestRow({
+            recordId: 51,
+            requestId: 'req-gone',
+            completeness: 'partial',
+            incompleteReason: 'no_terminal',
+          }),
+          requestRow({ recordId: 52, requestId: 'req-plain', completeness: 'partial' }),
+        ],
+        cursor: null,
+      },
+    ],
+    pageParams: [null],
+  });
+  try {
+    const html = renderToStaticMarkup(
+      <QueryClientProvider client={client}>
+        <WithRouter>
+          <RequestList search={search} go={() => {}} />
+        </WithRouter>
+      </QueryClientProvider>,
+    );
+    expect(html).toContain('联网搜索</span> 搜索「&lt;b&gt;bun sqlite&lt;/b&gt; wal」 等 3 项');
+    expect(html).toContain('7 条结果');
+    expect(html).toContain('会话 #5 第 12 轮使用');
+    expect(html).toContain('>完整</span>');
+    expect(html).toContain('>回复被截断</span>');
+    expect(html).toContain('>回复未正常结束</span>');
+    expect(html).toContain('>回复不完整</span>');
+  } finally {
+    client.clear();
+  }
+});
+
+function viewOf(path: string[], extra: Partial<RecordView>): RecordView {
+  return {
+    meta: {
+      id: 41,
+      received_at: 0,
+      source: 's',
+      upload_id: 'u',
+      host_request_id: 'req-search',
+      model: 'gpt-search',
+      channel: '',
+      user_label: 'u',
+      token_label: 'k',
+      outcome: 'ok',
+      truncated: 0,
+      media: 0,
+      duration_ms: null,
+      usage_json: '{}',
+      cost_json: '{}',
+      body_hash: '',
+      body_length: 0,
+      storage_mode: 'item_cas',
+    },
+    path,
+    node: { kind: 'object', preview: '', count: 0 },
+    entries: [],
+    text: null,
+    offset: 0,
+    nextOffset: null,
+    total: 0,
+    sections: [],
+    ...extra,
+  };
+}
+
+function renderRequestReader(search: AppSearch, row: RequestRow | null, output: string | null) {
+  const client = createDashboardQueryClient();
+  if (row) client.setQueryData(requestQuery(41).queryKey, row);
+  client.setQueryData(recordViewQuery(41, [], 0).queryKey, viewOf([], {}));
+  if (output !== null)
+    client.setQueryData(
+      recordViewQuery(41, SEARCH_OUTPUT_PATH, 0).queryKey,
+      viewOf(SEARCH_OUTPUT_PATH, {
+        node: { kind: 'string', preview: '', count: 20000 },
+        text: output,
+        nextOffset: 8192,
+        total: 20000,
+      }),
+    );
+  try {
+    return renderToStaticMarkup(
+      <QueryClientProvider client={client}>
+        <WithRouter>
+          <RequestReader recordId={41} search={search} />
+        </WithRouter>
+      </QueryClientProvider>,
+    );
+  } finally {
+    client.clear();
+  }
+}
+
+test('the search request reader shows operations, results, consuming turn and paged output', () => {
+  const search: AppSearch = { tab: 'requests', r: 41 };
+  const html = renderRequestReader(search, searchRow, 'Result <1> from the web');
+  expect(html).toContain('<h1>搜索「&lt;b&gt;bun sqlite&lt;/b&gt; wal」 等 3 项</h1>');
+  expect(html).toContain('<b>7</b> 条结果');
+  expect(html).toContain('>打开</span>');
+  expect(html).toContain('href="/?tab=requests&amp;c=5&amp;t=12"');
+  expect(html).toContain('会话 #5 第 12 轮');
+  expect(html).toContain('$0.010 · 5,000 quota');
+  expect(html).toContain('搜索返回给模型的文本');
+  expect(html).toContain('Result &lt;1&gt; from the web');
+  expect(html).toContain('0–8,192 / 20,000 字');
+  expect(html).toContain('原始数据');
+  expect(html).not.toContain('只能查看原始数据');
+  const unlinked = renderRequestReader(
+    search,
+    requestRow({ search: { operations: [], resultCount: null, linked: null } }),
+    'out',
+  );
+  expect(unlinked).toContain('没有找到唯一使用这次搜索输出的工具结果');
+  expect(unlinked).toContain('没有记录到具体操作');
+  // Non-search requests keep the plain raw-data reader.
+  const plain = renderRequestReader(search, requestRow({ protocol: 'openai_image' }), null);
+  expect(plain).toContain('只能查看原始数据');
+  expect(plain).not.toContain('搜索返回给模型的文本');
+});
+
+test('the request reader shows the missing-source state when its row is gone', async () => {
+  const client = createDashboardQueryClient();
+  // A cached error is otherwise re-fetched (and shown as pending) on mount.
+  client.setQueryDefaults(requestQuery(41).queryKey, { retryOnMount: false });
+  const realFetch = globalThis.fetch;
+  globalThis.fetch = (async () => new Response('{}', { status: 404 })) as unknown as typeof fetch;
+  try {
+    await client.prefetchQuery(requestQuery(41));
+  } finally {
+    globalThis.fetch = realFetch;
+  }
+  client.setQueryData(recordViewQuery(41, [], 0).queryKey, viewOf([], {}));
+  try {
+    const html = renderToStaticMarkup(
+      <QueryClientProvider client={client}>
+        <WithRouter>
+          <RequestReader recordId={41} search={{ tab: 'requests', r: 41 }} />
+        </WithRouter>
+      </QueryClientProvider>,
+    );
+    expect(html).toContain('没有找到这条内容，它可能已被容量清理删除。');
+    expect(html).not.toContain('只能查看原始数据');
+  } finally {
+    client.clear();
+  }
 });

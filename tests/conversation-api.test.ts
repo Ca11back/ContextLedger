@@ -15,6 +15,7 @@ import {
   fragments,
   lookup,
   relations,
+  requestDetail,
   requests,
   textContinuation,
   turns,
@@ -141,6 +142,7 @@ test('every new endpoint authenticates independently and sends no-store on error
     'fragments',
     'text',
     'requests',
+    'request',
     'lookup',
   ] as const) {
     const response = conversationHttp(
@@ -165,6 +167,156 @@ test('every new endpoint authenticates independently and sends no-store on error
   expect(response.status).toBe(200);
   expect(response.headers.get('cache-control')).toBe('no-store');
   bounded(await response.json());
+});
+
+test('single-request metadata is authenticated, validates ids, and never restores evidence', async () => {
+  const store = fixture();
+  const root = await insert(store);
+  const expected = requests(store, new URLSearchParams()).rows[0]!;
+  const headers = {
+    authorization: `Basic ${Buffer.from('admin:synthetic-admin-password').toString('base64')}`,
+  };
+  store.restore = () => {
+    throw new Error('request metadata must not restore evidence');
+  };
+  const response = conversationHttp(
+    new Request(`http://local/api/requests/${root.id}`, { headers }),
+    store,
+    'request',
+    String(root.id),
+  );
+  expect(response.status).toBe(200);
+  expect(response.headers.get('cache-control')).toBe('no-store');
+  expect(await response.json()).toEqual(expected);
+  expect(expected.incompleteReason).toBeNull();
+  expect(expected.search).toBeNull();
+  expect(requestDetail(store, root.id)).toEqual(expected);
+  for (const invalid of ['', '0', '-1', '01', '1.5', '9007199254740992']) {
+    const result = conversationHttp(
+      new Request('http://local/api/requests/invalid', { headers }),
+      store,
+      'request',
+      invalid,
+    );
+    expect(result.status).toBe(400);
+    expect(result.headers.get('cache-control')).toBe('no-store');
+  }
+  const missing = conversationHttp(
+    new Request('http://local/api/requests/999', { headers }),
+    store,
+    'request',
+    '999',
+  );
+  expect(missing.status).toBe(404);
+  expect(missing.headers.get('cache-control')).toBe('no-store');
+  expect(await missing.json()).toEqual({ error: 'record_not_found' });
+});
+
+test('search projections serialize attached coordinates and fragment summaries at normalized item indexes', async () => {
+  const store = fixture();
+  const consumer = await insert(
+    store,
+    envelope(
+      [
+        { role: 'user', content: 'search request' },
+        { type: 'function_call_output', call_id: 'call-search', output: 'result text' },
+      ],
+      undefined,
+      { instructions: 'synthetic instructions' },
+    ),
+  );
+  const search = await insert(store, envelope([], [], {}, 'openai_alpha_search'));
+  const summary = { operations: [{ kind: 'search' as const, text: 'test query' }], resultCount: 3 };
+  // Isolate API projection from evidence matching, which has separate integration tests.
+  store.db
+    .query('UPDATE requests SET search_summary=? WHERE id=?')
+    .run(JSON.stringify(summary), search.id);
+  store.db
+    .query('INSERT INTO search_links VALUES(?,?,?,?,?)')
+    .run(search.id, consumer.id, 2, 0, 'call-search');
+  store.db.query('UPDATE conversations SET search_count=1 WHERE id=?').run(consumer.conversation);
+  const restore = store.restore;
+  store.restore = () => {
+    throw new Error('metadata must not restore evidence');
+  };
+  expect(requestDetail(store, search.id).search).toEqual({
+    ...summary,
+    linked: { conversationId: consumer.conversation, turnIndex: consumer.turn },
+  });
+  expect(requests(store, new URLSearchParams()).rows[0]!.search).toEqual(
+    requestDetail(store, search.id).search,
+  );
+  expect(conversationDetail(store, consumer.conversation).conversation.searchCount).toBe(1);
+  store.restore = restore;
+  const all = collect(store, consumer.conversation).all;
+  const header = all.find((f) => f.type === 'message' && f.messageId === `${consumer.id}:input:2`);
+  expect(header?.type === 'message' && header.searches).toEqual([
+    { recordId: search.id, ...summary },
+  ]);
+  expect(
+    all
+      .filter((f) => f.type === 'message' && f.searches)
+      .map((f) => f.type === 'message' && f.kind),
+  ).toEqual(['tool_result']);
+});
+
+test('maximal escaped search summaries page within the JSON byte limit without losing metadata', async () => {
+  const store = fixture();
+  const summary = {
+    operations: Array.from({ length: 20 }, () => ({
+      kind: 'search' as const,
+      text: '\u0000'.repeat(200),
+    })),
+    resultCount: 0,
+  };
+  const ids: number[] = [];
+  for (let i = 0; i < 5; i++) {
+    const row = await insert(store, envelope([], [], {}, 'openai_alpha_search'));
+    ids.push(row.id);
+    store.db
+      .query('UPDATE requests SET search_summary=? WHERE id=?')
+      .run(JSON.stringify(summary), row.id);
+  }
+  const found: number[] = [];
+  let cursor: string | null = null;
+  do {
+    const page = requests(store, new URLSearchParams(cursor ? { cursor } : {}));
+    bounded(page);
+    expect(page.rows.length).toBeGreaterThan(0);
+    expect(page.rows.length).toBeLessThan(5);
+    for (const row of page.rows) {
+      expect(row.search).toEqual({ ...summary, linked: null });
+      found.push(row.recordId);
+    }
+    cursor = page.cursor;
+  } while (cursor);
+  expect(found).toEqual(ids.reverse());
+  const consumer = await insert(
+    store,
+    envelope([
+      { type: 'function_call_output', call_id: 'many-searches', output: 'synthetic output' },
+    ]),
+  );
+  for (const [part, searchId] of ids.slice(0, 3).entries()) {
+    store.db
+      .query('INSERT INTO search_links VALUES(?,?,?,?,?)')
+      .run(searchId, consumer.id, 0, part, 'many-searches');
+  }
+  error(() => fragments(store, consumer.conversation, new URLSearchParams()), 413);
+});
+
+test('stored incomplete reasons appear in request rows, turn summaries and fragment headers', async () => {
+  const store = fixture();
+  for (const reason of ['truncated', 'no_terminal', null] as const) {
+    const row = await insert(store);
+    store.db.query('UPDATE requests SET incomplete_reason=? WHERE id=?').run(reason, row.id);
+    expect(requestDetail(store, row.id).incompleteReason).toBe(reason);
+    expect(turns(store, row.conversation, new URLSearchParams()).turns[0]!.incompleteReason).toBe(
+      reason,
+    );
+    const header = collect(store, row.conversation).all.find((f) => f.type === 'turn');
+    expect(header?.type === 'turn' && header.turn.incompleteReason).toBe(reason);
+  }
 });
 
 test('gateway report statistics project across Responses, Chat, Claude and Gemini views', async () => {

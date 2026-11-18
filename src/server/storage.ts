@@ -7,12 +7,13 @@ import type { Config } from './config';
 import { LedgerError } from './errors';
 import {
   backfillConversations,
-  backfillStatistics,
+  backfillSearches,
   ConversationIndex,
   installConversationSchema,
   SCHEMA_VERSION,
 } from './linking';
 import { normalizeEnvelope } from './normalize';
+import { projectSearch, searchToolEvidence } from './search-evidence';
 
 interface Root extends RecordMeta {
   payload: Uint8Array;
@@ -67,7 +68,7 @@ export class Ledger {
       throw new Error('Database requires WAL mode');
     const version = (this.db.query('PRAGMA user_version').get() as { user_version: number })
       .user_version;
-    if (![0, 2, 3, 4, 5, SCHEMA_VERSION].includes(version))
+    if (![0, 2, 3, 4, 5, 6, SCHEMA_VERSION].includes(version))
       throw new Error('Unsupported database format');
     this.db.exec(`CREATE TABLE IF NOT EXISTS requests (
       id INTEGER PRIMARY KEY AUTOINCREMENT, received_at INTEGER NOT NULL, source TEXT NOT NULL, upload_id TEXT NOT NULL,
@@ -95,7 +96,7 @@ export class Ledger {
     try {
       if (version === 2 || version === 3 || version === 4)
         backfillConversations(this.db, (id) => this.restore(id));
-      else if (version === 5) backfillStatistics(this.db, (id) => this.restore(id));
+      else if (version === 5 || version === 6) backfillSearches(this.db, (id) => this.restore(id));
       else if (version === 0)
         this.transaction(() => {
           installConversationSchema(this.db);
@@ -144,7 +145,14 @@ export class Ledger {
         scalar(
           'SELECT coalesce(sum(length(CAST(user_id AS BLOB))+length(CAST(token_id AS BLOB))+length(CAST(protocol AS BLOB))+1024),0) FROM threads',
         ) +
-        scalar('SELECT coalesce(sum(length(model)+128),0) FROM conversation_models'),
+        scalar('SELECT coalesce(sum(length(model)+128),0) FROM conversation_models') +
+        scalar('SELECT coalesce(sum(length(CAST(search_summary AS BLOB))),0) FROM requests') +
+        scalar('SELECT coalesce(sum(length(CAST(call_id AS BLOB))+512),0) FROM tool_call_origins') +
+        scalar(
+          'SELECT coalesce(sum(length(CAST(call_id AS BLOB))+768),0) FROM tool_output_candidates',
+        ) +
+        scalar('SELECT coalesce(sum(length(CAST(call_id AS BLOB))+512),0) FROM tool_output_parts') +
+        scalar('SELECT coalesce(sum(length(CAST(call_id AS BLOB))+256),0) FROM search_links'),
       records: scalar('SELECT count(*) FROM requests'),
       objects: scalar('SELECT count(*) FROM objects'),
       max: this.config.maxStorageBytes,
@@ -210,9 +218,20 @@ export class Ledger {
     const prepared = options.prepared ?? (await prepare(bytes, options.forceWhole));
     const meta = metadata(envelope);
     const normalized = normalizeEnvelope(envelope);
+    const searchProjection = projectSearch(envelope, normalized);
+    const searchEvidence = searchToolEvidence(envelope, normalized);
     // Conservative B-tree/WAL expansion reserve; reject an inadmissible single record before deleting history.
     const baseCost =
       prepared.payload.length +
+      Buffer.byteLength(JSON.stringify(searchProjection)) * 3 +
+      searchEvidence.origins.reduce(
+        (sum, origin) => sum + Buffer.byteLength(origin.callId) + 768,
+        0,
+      ) +
+      searchEvidence.parts.reduce(
+        (sum, part) => sum + 3 * Buffer.byteLength(part.callId) + 2048,
+        0,
+      ) +
       16_384 +
       Buffer.byteLength(normalized.responseId ?? '') +
       Buffer.byteLength(normalized.previousResponseId ?? '') +
@@ -261,6 +280,8 @@ export class Ledger {
     const indexMeta = {
       ...meta,
       rawUsage: envelope.report.usage,
+      searchProjection,
+      searchEvidence,
       source: envelope.source,
       received_at: options.receivedAt ?? options.now?.() ?? Date.now(),
     };

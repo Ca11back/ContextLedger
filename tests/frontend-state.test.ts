@@ -96,6 +96,7 @@ const turn = (turnIndex: number, extra: Partial<TurnSummary> = {}): TurnSummary 
   charge: null,
   durationMs: null,
   completeness: 'complete',
+  incompleteReason: null,
   linkRule: null,
   parentOutputIncomplete: false,
   contextReset: null,

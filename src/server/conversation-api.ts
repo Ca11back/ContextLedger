@@ -9,6 +9,7 @@ import type {
   FragmentPage,
   RequestList,
   RequestRow,
+  SearchSummary,
   TextChunk,
   TurnList,
   TurnSummary,
@@ -40,6 +41,8 @@ interface RequestDb extends RecordMeta, Statistics {
   stop_reason: string | null;
   retry_of_turn: number | null;
   superseded: number;
+  incomplete_reason: TurnSummary['incompleteReason'];
+  search_summary: string | null;
 }
 interface ConversationDb extends Statistics {
   id: number;
@@ -65,10 +68,11 @@ interface ConversationDb extends Statistics {
   subagent_count: number;
   user_label: string | null;
   token_label: string | null;
+  search_count: number;
 }
 const requestColumns = `id,received_at,source,host_request_id,model,user_label,token_label,truncated,media,duration_ms,
   protocol,completeness,input_tokens,output_tokens,charge_quota,cache_read_tokens,cache_write_tokens,input_total_tokens,charge_usd,conversation_id,turn_index,link_rule,parent_id,
-  context_reset,evidence_count,parent_coverage,stop_reason,retry_of_turn,superseded`;
+  context_reset,evidence_count,parent_coverage,stop_reason,retry_of_turn,superseded,incomplete_reason,search_summary`;
 const conversationSelect = `SELECT c.*, t.subagent_of, t.agent_name, t.subagent_kind,
   CASE WHEN c.id=t.primary_conversation_id THEN coalesce(t.subagent_count,0) ELSE 0 END AS subagent_count,
   (SELECT user_label FROM requests WHERE conversation_id=c.id ORDER BY turn_index LIMIT 1) AS user_label,
@@ -149,6 +153,7 @@ function rowView(store: Ledger, row: ConversationDb): ConversationRow {
     agentName: row.agent_name,
     subagentKind: row.subagent_kind,
     subagentCount: row.subagent_count,
+    searchCount: row.search_count,
   };
 }
 function turnView(row: RequestDb): TurnSummary {
@@ -164,6 +169,7 @@ function turnView(row: RequestDb): TurnSummary {
     charge: row.charge_quota,
     durationMs: row.duration_ms,
     completeness: row.completeness,
+    incompleteReason: row.incomplete_reason,
     linkRule: row.link_rule,
     parentOutputIncomplete: row.link_rule === 'prefix_partial',
     contextReset: row.context_reset,
@@ -173,7 +179,18 @@ function turnView(row: RequestDb): TurnSummary {
     superseded: !!row.superseded,
   };
 }
-function requestView(row: RequestDb): RequestRow {
+function requestView(store: Ledger, row: RequestDb): RequestRow {
+  const search = searchSummary(row.search_summary);
+  // One indexed lookup per search row, bounded by the list's maximum of 50 rows.
+  const linked = search
+    ? store.db
+        .query<{ conversationId: number; turnIndex: number }, [number]>(
+          `SELECT r.conversation_id AS conversationId,r.turn_index AS turnIndex
+           FROM search_links l JOIN requests r ON r.id=l.consumer_record_id
+           WHERE l.search_record_id=?`,
+        )
+        .get(row.id)
+    : null;
   return {
     ...statisticsView(row),
     recordId: row.id,
@@ -185,6 +202,7 @@ function requestView(row: RequestDb): RequestRow {
     model: row.model,
     protocol: row.protocol,
     completeness: row.completeness,
+    incompleteReason: row.incomplete_reason,
     truncated: !!row.truncated,
     media: !!row.media,
     durationMs: row.duration_ms,
@@ -193,7 +211,28 @@ function requestView(row: RequestDb): RequestRow {
     charge: row.charge_quota,
     conversationId: row.conversation_id,
     turnIndex: row.turn_index,
+    search: search ? { ...search, linked: linked ?? null } : null,
   };
+}
+function searchSummary(value: string | null): Omit<SearchSummary, 'recordId'> | null {
+  return value === null ? null : JSON.parse(value);
+}
+function messageSearches(store: Ledger, recordId: number, itemIndex: number): SearchSummary[] {
+  const result: SearchSummary[] = [];
+  const rows = store.db
+    .query<{ id: number; search_summary: string }, [number, number]>(
+      `SELECT r.id,r.search_summary FROM search_links l
+       JOIN requests r ON r.id=l.search_record_id
+       WHERE l.consumer_record_id=? AND l.item_index=? ORDER BY l.part_index`,
+    )
+    .iterate(recordId, itemIndex);
+  for (const row of rows) {
+    const summary = searchSummary(row.search_summary);
+    if (summary) result.push({ recordId: row.id, ...summary });
+    // Stop reading once a single message header cannot fit; never silently drop a search.
+    if (bytes(result) > CONTENT_BUDGET) throw new LedgerError(413, 'response_too_large');
+  }
+  return result;
 }
 function statisticsView(row: Statistics) {
   return {
@@ -393,7 +432,17 @@ export function requests(store: Ledger, params: URLSearchParams): RequestList {
         )} FROM requests r ${where.length ? `WHERE ${where.join(' AND ')}` : ''} ORDER BY r.received_at DESC,r.id DESC LIMIT ?`,
     )
     .all(...args, limit + 1);
-  return page(store, rows, limit, scope, requestView, (r) => [r.received_at, r.id]);
+  return page(
+    store,
+    rows,
+    limit,
+    scope,
+    (r) => requestView(store, r),
+    (r) => [r.received_at, r.id],
+  );
+}
+export function requestDetail(store: Ledger, recordId: number): RequestRow {
+  return boundedJson(requestView(store, existingRequest(store, recordId))) as RequestRow;
 }
 export function lookup(store: Ledger, params: URLSearchParams) {
   const q = params.get('q');
@@ -678,6 +727,10 @@ export function fragments(
         if (!entry) break;
         const m = entry.message;
         if (stage === 2) {
+          const searches =
+            m.side === 'input' && m.kind === 'tool_result'
+              ? messageSearches(store, row.id, m.index)
+              : [];
           fragment = {
             type: 'message',
             messageId: messageId(row, m),
@@ -691,6 +744,7 @@ export function fragments(
             ...(m.alternatives === undefined ? {} : { alternatives: m.alternatives }),
             partCount: m.parts.length,
             ...(entry.leadingHistory ? { leadingHistory: true } : {}),
+            ...(searches.length ? { searches } : {}),
           };
           nextStage = m.parts.length ? 3 : 2;
           if (!m.parts.length) nextMi++;
@@ -762,6 +816,7 @@ export type ConversationEndpoint =
   | 'fragments'
   | 'text'
   | 'requests'
+  | 'request'
   | 'lookup';
 export function conversationHttp(
   request: Request,
@@ -794,6 +849,9 @@ export function conversationHttp(
         break;
       case 'requests':
         result = requests(store, params);
+        break;
+      case 'request':
+        result = requestDetail(store, id(target ?? ''));
         break;
       case 'lookup':
         result = lookup(store, params);

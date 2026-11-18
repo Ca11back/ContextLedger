@@ -147,7 +147,10 @@ export function responses(
   events: CapturedEvent[],
 ): AdapterResult {
   let selected = final;
-  let terminal = Array.isArray(final.output) && final.status === 'completed';
+  let completed = Array.isArray(final.output) && final.status === 'completed';
+  let terminal =
+    final.status === 'completed' || final.status === 'incomplete' || final.status === 'failed';
+  let incomplete = final.status === 'incomplete';
   const recovered = new Map<number, NormalizedMessage>();
   let nextIndex = 0;
   const announced: AnnouncedOutputItem[] = [];
@@ -157,9 +160,15 @@ export function responses(
   let sawAnnouncement = false;
   let recoveryValid = true;
   for (const event of events) {
-    if (event.type === 'response.completed' && Array.isArray(object(event.data.response).output)) {
-      selected = object(event.data.response);
-      terminal = selected.status === undefined || selected.status === 'completed';
+    if (['response.completed', 'response.incomplete', 'response.failed'].includes(event.type)) {
+      terminal = true;
+      const snapshot = object(event.data.response);
+      if (event.type === 'response.incomplete') incomplete = true;
+      if (Object.keys(snapshot).length) selected = snapshot;
+      if (event.type === 'response.completed')
+        completed =
+          Array.isArray(snapshot.output) &&
+          (snapshot.status === undefined || snapshot.status === 'completed');
     }
     if (event.type === 'response.output_item.added') {
       sawAnnouncement = true;
@@ -221,7 +230,7 @@ export function responses(
   }
 
   const output =
-    Array.isArray(selected.output) && (terminal || recovered.size === 0)
+    Array.isArray(selected.output) && (completed || recovered.size === 0)
       ? selected.output.map((item) =>
           responseItem(
             item,
@@ -256,7 +265,7 @@ export function responses(
         } else announcement.completedHash = item.itemHash;
       }
     }
-  if (!recoveryValid && !terminal && output[0]) output[0].prefixKnown = false;
+  if (!recoveryValid && !completed && output[0]) output[0].prefixKnown = false;
   const validAnnouncements =
     announcementsValid &&
     sawAnnouncement &&
@@ -266,8 +275,9 @@ export function responses(
     input: inputItems(body),
     output,
     terminal,
+    incomplete,
     // Invalid recovery positions remain readable but cannot establish a prefix.
-    ...(!recoveryValid && !terminal ? { invalid: true } : {}),
+    ...(!completed && (!recoveryValid || (terminal && !incomplete)) ? { invalid: true } : {}),
     announcedOutput: validAnnouncements ? announced : [],
     announcementsValid: validAnnouncements,
     responseId:

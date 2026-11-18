@@ -6,6 +6,7 @@ import type {
   FragmentPage,
   LookupResult,
   RequestList,
+  RequestRow,
   TextChunk,
 } from '../conversation-contracts';
 import type { RecordView } from '../view-contracts';
@@ -72,6 +73,14 @@ export function requestsQuery(search: AppSearch) {
         signal,
       ),
     getNextPageParam: (page) => page.cursor,
+  });
+}
+
+/** One request row, including its search projection and incomplete reason. */
+export function requestQuery(id: number) {
+  return queryOptions({
+    queryKey: ['request', id],
+    queryFn: ({ signal }) => readJson<RequestRow>(`/api/requests/${id}`, signal),
   });
 }
 

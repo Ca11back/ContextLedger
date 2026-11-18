@@ -80,6 +80,8 @@ export interface AdapterResult {
   input: NormalizedMessage[];
   output: NormalizedMessage[];
   terminal: boolean;
+  /** A protocol terminal explicitly reports incomplete model output. */
+  incomplete?: boolean;
   invalid?: boolean;
   responseId?: string;
   stopReason?: string;
