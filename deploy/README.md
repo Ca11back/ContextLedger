@@ -13,6 +13,7 @@ ContextLedger 服务有现成的 Docker 镜像：`ghcr.io/ca11back/contextledger
 ```sh
 mkdir -p contextledger/data
 sudo chown 1000:1000 contextledger/data      # 镜像里以 UID 1000 运行
+sudo chmod 700 contextledger/data            # 数据库里是完整对话，别让其他账号读
 curl -fsSL -o contextledger/ledger.env https://raw.githubusercontent.com/Ca11back/ContextLedger/main/deploy/ledger.env.example
 chmod 600 contextledger/ledger.env
 ```
@@ -43,6 +44,7 @@ chmod 600 contextledger/ledger.env
 ```sh
 docker compose up -d contextledger
 docker compose ps contextledger          # 状态变成 healthy 就是启动好了
+curl -fsS http://127.0.0.1:18740/healthz # 显示版本号和支持的协议版本
 ```
 
 **3. 配置插件**
@@ -73,63 +75,89 @@ ssh -N -L 18740:127.0.0.1:18740 <你的服务器>
 | `0.3.0` | 固定这一个版本 |
 | `latest` | 最新版本，可能包含不兼容的变化，不建议用 |
 
-插件和服务端各有版本号，靠上传协议的版本对接。服务端会兼容上一版协议，所以**先升级服务端，再升级插件**，顺序反过来可能会有一段时间漏记。插件 README 里写了它需要的最低服务端版本。
+插件和服务端各有版本号，靠上传协议的版本对接，目前只有一版协议。以后协议升级时，新服务端会同时兼容上一版，所以**先升级服务端，再升级插件**。插件 README 里写了它需要的最低服务端版本。
 
-升级服务端：
+升级到推荐标签以外的系列（比如从 `0.3` 改成 `0.4`）前，先看更新说明。
 
-```sh
-docker compose exec contextledger bun run server.ts backup /data/backups/before-upgrade.sqlite
-docker compose pull contextledger
-docker compose up -d contextledger
-```
+### 升级服务端
 
-改成新的大版本（比如 `0.3` 改 `0.4`）前，先看更新说明。
+1. 记下现在用的镜像版本，回滚时要用：`docker compose images contextledger`。
+2. 拉取新镜像，停掉旧服务：
 
-新版本需要升级数据库格式时，服务会在启动前自动备份一份到 `data/backups/`，备份成功才升级。数据库大的话启动会慢一些，等它开始监听就好。备份失败（比如磁盘满了）时服务直接退出，旧数据不会被改动，解决问题后重启即可。
+   ```sh
+   docker compose pull contextledger
+   docker compose stop contextledger
+   ```
 
-`docker compose exec contextledger wget -qO- http://127.0.0.1:3000/healthz` 可以看到当前版本和支持的协议版本。
+3. 想另外留一份手动备份的话，用新镜像备份（旧镜像可能还没有备份命令）：
+
+   ```sh
+   docker compose run --rm --no-deps contextledger bun run server.ts backup /data/backups/before-upgrade-2026-11-19.sqlite
+   ```
+
+4. 启动并确认健康：
+
+   ```sh
+   docker compose up -d --no-deps contextledger
+   docker compose ps contextledger
+   curl -fsS http://127.0.0.1:18740/healthz
+   ```
+
+停机这段时间插件上传不了，会漏记，挑空闲时段升级。
+
+新版本需要升级数据库格式时，服务会在启动前自动备份一份到 `data/backups/`，备份成功才升级。数据库大的话启动会慢一些，等状态变成 healthy 就好。备份失败（比如磁盘满了、`backups` 目录权限不是 700）时服务直接退出，旧数据不会被改动，解决问题后重新启动即可。自动备份要求数据目录所在的文件系统支持硬链接，普通 Linux 磁盘都可以，部分网络盘不行。
 
 ### 回滚
 
-- **数据库格式没变**：把 `image` 改回旧标签，`docker compose up -d contextledger`。
-- **数据库格式变了**：旧版本读不了新格式，要用升级前的备份：
+- **数据库格式没变**：把 `image` 改回记下的旧版本，`docker compose up -d --no-deps contextledger`。
+- **数据库格式变了**：旧版本读不了新格式，要用升级前的备份。路径按你的挂载目录调整：
 
   ```sh
+  data=contextledger/data
+  snapshot="$data/backups/ledger-schema7-20261119T010000Z.sqlite"   # 换成实际要恢复的备份
+  keep="$data/upgraded-$(date +%Y%m%d%H%M%S)"                        # 升级后的数据先移到这里留着
+
   docker compose stop contextledger
-  mkdir -p contextledger/rolled-back
-  mv contextledger/data/ledger.sqlite* contextledger/rolled-back/      # 连同 -wal、-shm 一起移走
-  cp contextledger/data/backups/<升级前的备份>.sqlite contextledger/data/ledger.sqlite
-  sudo chown 1000:1000 contextledger/data/ledger.sqlite
-  # 把 image 改回旧标签
-  docker compose up -d contextledger
+  sudo install -d -m 700 -o 1000 -g 1000 "$keep"
+  for f in ledger.sqlite ledger.sqlite-wal ledger.sqlite-shm ledger.sqlite-journal; do
+    sudo test -e "$data/$f" && sudo mv "$data/$f" "$keep/"
+  done
+  sudo install -m 600 -o 1000 -g 1000 "$snapshot" "$data/ledger.sqlite"
+  # 把 compose 里的 image 改回记下的旧版本
+  docker compose up -d --no-deps contextledger
+  docker compose ps contextledger
   ```
 
-  升级之后新记下的内容不在旧备份里，回滚后就没有了。
+  升级之后新记下的内容不在旧备份里，回滚后网页上看不到，但还留在 `$keep` 目录里。确认不需要了再删。
 
 ## 备份
 
 服务运行时备份：
 
 ```sh
-docker compose exec contextledger bun run server.ts backup /data/backups/2026-11-19.sqlite
+docker compose exec contextledger bun run server.ts backup /data/backups/manual-2026-11-19.sqlite
 ```
 
 服务停止时备份：
 
 ```sh
-docker compose run --rm --no-deps contextledger bun run server.ts backup /data/backups/2026-11-19.sqlite
+docker compose run --rm --no-deps contextledger bun run server.ts backup /data/backups/manual-2026-11-19.sqlite
 ```
 
 - 每次用新文件名，目标已存在会拒绝（`backup_destination_exists`）。
-- 运行时备份会短暂拖住写入，流量大时可能有几条上传被暂时拒绝而漏记。尽量挑空闲时段；不能接受漏记的话，停服务再备份。
-- 自动备份（升级前那种）只保留最近两份；手动备份不会自动删除，自己清理。
+- 运行时备份期间数据库没法整理日志文件，流量大时可能有几条上传被暂时拒绝（HTTP 507）而漏记。尽量挑空闲时段；不能接受漏记的话，停服务再备份。
+- `backups` 目录权限必须是 700，服务会自动创建。自动备份（升级前那种）只保留最近两份；手动备份不会自动删除，自己清理。
 - 备份里是完整的对话内容，和数据库一样要保管好。
 
-恢复：停服务，按上面「数据库格式变了」的步骤把备份放回 `data/ledger.sqlite`。
+恢复：按上面「数据库格式变了」的步骤，把要恢复的备份放回去。
 
 ## 磁盘空间
 
-`LEDGER_MAX_STORAGE_MB` 只限制数据库本身，快满时自动从最旧的记录开始删。备份、镜像和日志另算。升级时会同时存在数据库、两份旧的自动备份和一份新备份，所以磁盘至少要留出存储上限的 4 倍空间，再加上你自己的手动备份。
+`LEDGER_MAX_STORAGE_MB` 只限制数据库本身（含 `-wal`、`-shm`），快满时自动从最旧的记录开始删。备份、日志和镜像另算。
+
+按存储上限 10 GB 估算：数据库本身、保留的两份自动备份、升级时正在写的新备份，每份都可能接近 10 GB，这几项合计约 40 GB。在此之外再给数据库升级留些余量，加上你的手动备份、日志、镜像和同一块盘上的其他服务。调低过存储上限，或者备份来自更大的旧库时，按实际文件大小算。
+
+如果遇到 SQLite 临时空间不足的错误，可以设置 `SQLITE_TMPDIR` 指向 `/data` 下一个已存在的目录，不要直接把内存里的 `/tmp` 调大。
 
 ## 配置
 
@@ -175,7 +203,11 @@ Compose 里把 `image` 换成 `contextledger:local`。
 
 ## 附录：数据校验
 
-源码仓库里的 `scripts/integrity.ts` 可以检查所有数据能否完整还原，镜像里没有。用和服务相同版本的源码，停掉服务，准备一个 `LEDGER_DATABASE` 指向数据库文件绝对路径的环境文件（权限 `0600`），在源码根目录执行：
+源码仓库里的 `scripts/integrity.ts` 可以检查所有数据能否完整还原，镜像里没有，要用和服务**相同版本**的源码运行（不同版本可能会顺手升级数据库格式）。
+
+1. 停掉服务。
+2. 复制一份服务用的 `ledger.env`（权限 `0600`），把里面的 `LEDGER_DATABASE` 改成宿主机上数据库文件的绝对路径，其他配置保持不变。
+3. 在源码根目录执行：
 
 ```sh
 bun --env-file=/secure/maintenance.env run integrity             # 只检查
