@@ -15,6 +15,7 @@ const statuses: Record<string, number | number[]> = {
   record_exceeds_storage_budget: 507,
   storage_pressure: 507,
   invalid_wire: 400,
+  unsupported_wire_version: 400,
   invalid_manifest: 400,
   inconsistent_length: [400, 409],
   envelope_length_mismatch: 400,

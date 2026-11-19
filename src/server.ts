@@ -5,6 +5,7 @@ import { ledger, startMaintenance } from './server/runtime';
 
 const start = createStartHandler(defaultStreamHandler);
 export default {
+  initialize: startMaintenance,
   async fetch(request: Request) {
     const path = new URL(request.url).pathname;
     try {

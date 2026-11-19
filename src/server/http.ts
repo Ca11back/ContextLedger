@@ -2,7 +2,7 @@ import { privateHeaders, requireAdmin, requireIngest } from './auth';
 import { ingestDiagnostic } from './diagnostics';
 import { failure, LedgerError } from './errors';
 import type { Ledger } from './storage';
-import { Transport } from './transport';
+import { SUPPORTED_WIRE_VERSIONS, Transport } from './transport';
 export async function readBounded(
   request: Request,
   max: number,
@@ -56,10 +56,18 @@ export async function ingestHttp(
     );
     return privateHeaders(Response.json(result, { status }));
   } catch (error) {
-    const response = privateHeaders(failure(error));
+    const ledgerError = error instanceof LedgerError ? error : undefined;
+    const response = privateHeaders(
+      ledgerError?.code === 'unsupported_wire_version'
+        ? Response.json(
+            { error: ledgerError.code, supported: SUPPORTED_WIRE_VERSIONS },
+            { status: ledgerError.status },
+          )
+        : failure(error),
+    );
     ingestDiagnostic(
       response.status,
-      error instanceof LedgerError ? error.code : 'internal_error',
+      ledgerError?.code ?? 'internal_error',
       receivedBytes,
       performance.now() - started,
     );

@@ -1,8 +1,9 @@
-import { afterEach, expect, test } from 'bun:test';
+import { afterEach, expect, spyOn, test } from 'bun:test';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { hash } from '../src/server/codec';
+import { ingestHttp } from '../src/server/http';
 import { Ledger } from '../src/server/storage';
 import { Transport } from '../src/server/transport';
 import { batches, literalManifest, objectBody, type Transfer, transfer } from './transfer-helpers';
@@ -81,6 +82,41 @@ test('single wire2 path rejects direct envelopes, extra fields and wrong interna
   await expect(wire.receive(encode(wrong))).rejects.toThrow('invalid_envelope');
   expect(store.metrics().records).toBe(0);
   expect(wire.list().uploads.some((u: any) => u.state === 'failed')).toBe(true);
+});
+test('ingest reports supported versions only after authenticating an unsupported version request', async () => {
+  const { store, wire } = setup();
+  const secret = 'synthetic-unsupported-wire-private-content';
+  const request = (version: unknown, authorization = `Bearer ${store.config.ingestToken}`) =>
+    new Request('http://local/api/ingest', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: authorization },
+      body: JSON.stringify({ wire_version: version, prompt: secret }),
+    });
+  const log = spyOn(console, 'info').mockImplementation(() => {});
+  try {
+    for (const authorization of ['', 'Bearer wrong']) {
+      const response = await ingestHttp(request(3, authorization), store, wire);
+      expect(response.status).toBe(401);
+      expect(await response.json()).toEqual({ error: 'ingest_auth_required' });
+    }
+    const unsupported = await ingestHttp(request(3), store, wire);
+    expect(unsupported.status).toBe(400);
+    expect(unsupported.headers.get('Cache-Control')).toBe('no-store');
+    expect(await unsupported.json()).toEqual({ error: 'unsupported_wire_version', supported: [2] });
+    expect(JSON.parse(String(log.mock.calls.at(-1)?.[0]))).toMatchObject({
+      event: 'ingest_outcome',
+      status: 400,
+      code: 'unsupported_wire_version',
+    });
+    for (const version of [undefined, null, '2', false, 0, -1, 2.5, 2 ** 53, {}]) {
+      const malformed = await ingestHttp(request(version), store, wire);
+      expect(malformed.status).toBe(400);
+      expect(await malformed.json()).toEqual({ error: 'invalid_wire' });
+    }
+    expect(JSON.stringify(log.mock.calls)).not.toContain(secret);
+  } finally {
+    log.mockRestore();
+  }
 });
 test('all-literal manifest proves exact whitespace/duplicate keys and exact manifest retry identity', async () => {
   const { wire, store } = setup();

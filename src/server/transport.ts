@@ -2,6 +2,10 @@ import { object } from '../contracts';
 import { decodeParts, hash, type Part, type Prepared, verify } from './codec';
 import { LedgerError } from './errors';
 import type { Ledger } from './storage';
+
+const WIRE_VERSION = 2;
+export const SUPPORTED_WIRE_VERSIONS: readonly number[] = [WIRE_VERSION];
+
 export type Recipe = (['l', string] | ['r', string, number])[];
 interface Ref {
   hash: string;
@@ -10,7 +14,7 @@ interface Ref {
   priority: number;
 }
 interface Manifest {
-  wire_version: 2;
+  wire_version: typeof WIRE_VERSION;
   op: 'manifest';
   source: string;
   upload_id: string;
@@ -134,14 +138,14 @@ export class Transport {
     } catch {
       return fail(400, 'invalid_wire');
     }
-    if (
-      data.wire_version !== 2 ||
-      data.source !== this.store.config.source ||
-      !validString(data.upload_id, uuid)
-    )
+    const version = data.wire_version;
+    if (typeof version !== 'number' || !Number.isSafeInteger(version) || version <= 0)
+      fail(400, 'invalid_wire');
+    if (!SUPPORTED_WIRE_VERSIONS.includes(version)) fail(400, 'unsupported_wire_version');
+    if (data.source !== this.store.config.source || !validString(data.upload_id, uuid))
       fail(400, 'invalid_wire');
     await this.expire();
-    const id = data.upload_id as string;
+    const id = data.upload_id;
     if (data.op === 'manifest') await this.manifest(data as unknown as Manifest, bytes);
     else if (data.op === 'objects') await this.objects(data);
     else fail(400, 'invalid_wire');
@@ -537,7 +541,7 @@ export class Transport {
       if (!this.store.db.query('SELECT 1 FROM requests WHERE id=?').get(upload.record_id))
         fail(410, 'upload_record_evicted');
       return {
-        wire_version: 2,
+        wire_version: WIRE_VERSION,
         upload_id: id,
         state: 'complete',
         missing: [],
@@ -554,7 +558,7 @@ export class Transport {
       )
       .all(id);
     return {
-      wire_version: 2,
+      wire_version: WIRE_VERSION,
       upload_id: id,
       state: 'partial',
       missing: missing.slice(0, 4096).map((ref) => ref.idx),
