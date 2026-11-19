@@ -148,7 +148,7 @@ docker compose run --rm --no-deps contextledger bun run server.ts backup /data/b
 ```
 
 - 每次用新文件名，目标已存在会拒绝（`backup_destination_exists`）。
-- 备份被强行中断（比如容器被杀、断电）时可能留下 `.contextledger-backup-*.tmp` 文件。确认没有备份命令在运行后，可以把它和同名的 `-wal`、`-shm` 文件一起删掉。
+- 备份被强行中断（比如容器被杀、断电）时可能留下 `.contextledger-backup-*.tmp` 文件。确认没有备份命令在运行后，可以把它和同名的 `-wal`、`-shm`、`-journal` 文件一起删掉。
 - 运行时备份期间数据库没法整理日志文件，流量大时可能有几条上传被暂时拒绝（HTTP 507）而漏记。尽量挑空闲时段；不能接受漏记的话，停服务再备份。
 - `backups` 目录权限必须是 700，服务会自动创建。自动备份（升级前那种）只保留最近两份；手动备份不会自动删除，自己清理。
 - 备份里是完整的对话内容，和数据库一样要保管好。
