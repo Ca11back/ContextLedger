@@ -2,10 +2,7 @@
 # 按你自己的环境修改网络名、端口和路径。
 services:
   contextledger:
-    build:
-      context: ./contextledger/runtime   # bun run package:runtime 生成的目录
-      dockerfile: Dockerfile
-    image: contextledger:local
+    image: ghcr.io/ca11back/contextledger:0.3   # 0.3 系列的最新修复版
     container_name: contextledger
     restart: unless-stopped
     networks:

@@ -100,8 +100,8 @@ bun --env-file=.env run start
 
 ## 接到 new-api 上
 
-1. 部署记录服务，保证 new-api 能访问到它，比如放进同一个 Docker 网络。步骤见 [deploy/README.md](deploy/README.md)。
-2. 在 new-api 后台的「插件」页面上传 [plugins/ca11back_contextledger/plugin.js](plugins/ca11back_contextledger/plugin.js)，同目录的 `icon.png` 可以作为图标一起上传。
+1. 用现成的 Docker 镜像部署记录服务，放进 new-api 所在的 Docker 网络。步骤见 [deploy/README.md](deploy/README.md) 的「快速开始」。
+2. 在 new-api 后台从插件市场安装 ContextLedger；也可以在「插件」页面直接上传 [plugins/ca11back_contextledger/plugin.js](plugins/ca11back_contextledger/plugin.js)，同目录的 `icon.png` 作为图标。
 3. 新建一个请求处理实例，填三项：
    - `url`：记录服务的接收地址，例如 `http://contextledger:3000/api/ingest`
    - `token`：上面设的 `LEDGER_INGEST_TOKEN`
@@ -112,7 +112,7 @@ bun --env-file=.env run start
 
 ## 更多
 
-打包、Docker 部署、全部配置项、接口列表、数据校验和备份，都在 [deploy/README.md](deploy/README.md)。
+Docker 部署、升级和回滚、备份、全部配置项，都在 [deploy/README.md](deploy/README.md)。
 
 技术栈：Bun、TanStack Start、React、Rsbuild、SQLite、zstd。
 
