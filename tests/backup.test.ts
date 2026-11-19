@@ -51,6 +51,15 @@ function stageRuntime(directory: string) {
     copyFileSync(new URL(`../${path}`, import.meta.url), join(directory, path));
 }
 
+function runBackup(directory: string, database: string, target: string) {
+  return spawnSync(process.execPath, ['--no-env-file', 'run', 'server.ts', 'backup', target], {
+    cwd: directory,
+    env: { LEDGER_DATABASE: database },
+    encoding: 'utf8',
+    timeout: 6000,
+  });
+}
+
 function setVersion(config: Config, version: number) {
   const ledger = new Ledger(config);
   try {
@@ -116,7 +125,7 @@ test('pre-migration backup errors leave the old database byte-identical and retr
   setVersion(config, 5);
   const original = readFileSync(config.database);
   mkdirSync(backups, { mode: 0o500 });
-  expect(openFailure(config)).toBe('migration_backup_failed');
+  expect(openFailure(config)).toBe('backup_directory_unsafe');
   expect(readFileSync(config.database)).toEqual(original);
   expect(readdirSync(backups)).toEqual([]);
 
@@ -129,6 +138,129 @@ test('pre-migration backup errors leave the old database byte-identical and retr
   expect(statSync(snapshot).mode & 0o777).toBe(0o600);
   expect(versionAt(snapshot)).toEqual({ user_version: 5 });
 });
+
+for (const kind of ['wrong mode', 'regular file', 'symlink', 'dangling symlink'] as const) {
+  test(`preflight and operator backup report an unsafe default backups path (${kind})`, () => {
+    const { config, directory, backups } = fixture();
+    stageRuntime(directory);
+    setVersion(config, 5);
+    if (kind === 'wrong mode') {
+      mkdirSync(backups, { mode: 0o755 });
+      chmodSync(backups, 0o755);
+    } else if (kind === 'regular file') {
+      writeFileSync(backups, 'preserve me');
+    } else {
+      const referred = join(directory, 'referred');
+      if (kind === 'symlink') mkdirSync(referred, { mode: 0o700 });
+      symlinkSync(referred, backups);
+    }
+
+    const before = readFileSync(config.database);
+    expect(openFailure(config)).toBe('backup_directory_unsafe');
+    for (const target of [join(backups, 'operator.sqlite'), `${backups}/./operator.sqlite`]) {
+      const manual = runBackup(directory, config.database, target);
+      expect(manual.status).toBe(1);
+      expect(JSON.parse(manual.stderr)).toEqual({
+        event: 'backup_failed',
+        code: 'backup_directory_unsafe',
+      });
+    }
+    expect(readFileSync(config.database)).toEqual(before);
+    if (kind === 'regular file') expect(readFileSync(backups, 'utf8')).toBe('preserve me');
+    if (kind === 'symlink') expect(readdirSync(backups)).toEqual([]);
+  });
+}
+
+test('read-only source inspection distinguishes a non-database from corrupt SQLite', () => {
+  const { config, directory, backups } = fixture();
+  stageRuntime(directory);
+  writeFileSync(config.database, 'Plain data with a private marker'.repeat(32));
+  expect(openFailure(config)).toBe('unsupported_database_format');
+  const target = join(directory, 'manual.sqlite');
+  const notDatabase = runBackup(directory, config.database, target);
+  expect(notDatabase.status).toBe(1);
+  expect(JSON.parse(notDatabase.stderr)).toEqual({
+    event: 'backup_failed',
+    code: 'unsupported_database_format',
+  });
+
+  const corrupted = { ...config, database: join(directory, 'corrupt.sqlite') };
+  setVersion(corrupted, 5);
+  const bytes = readFileSync(corrupted.database);
+  // Damage the first schema b-tree page while keeping SQLite's file header and version.
+  bytes.fill(255, 100, 104);
+  writeFileSync(corrupted.database, bytes);
+  expect(openFailure(corrupted)).toBe('initialization_failed');
+  const corrupt = runBackup(directory, corrupted.database, target);
+  expect(corrupt.status).toBe(1);
+  expect(JSON.parse(corrupt.stderr)).toEqual({ event: 'backup_failed', code: 'backup_failed' });
+  expect(existsSync(target)).toBe(false);
+  expect(existsSync(backups)).toBe(false);
+});
+
+test('an ordinary publisher failure removes only this snapshot staging file and its sidecars', () => {
+  const { config, directory, backups } = fixture();
+  setVersion(config, 5);
+  const before = readFileSync(config.database);
+  mkdirSync(backups, { mode: 0o700 });
+  const other = '.contextledger-backup-another-job.tmp';
+  writeFileSync(join(backups, other), 'preserve concurrent staging', { mode: 0o600 });
+  const module = new URL('../src/server/storage.ts', import.meta.url).href;
+  const backupModule = new URL('../src/server/backup.ts', import.meta.url).href;
+  const result = spawnSync(
+    process.execPath,
+    [
+      '--no-env-file',
+      '-e',
+      `import { mock } from 'bun:test';
+       import * as fs from 'node:fs';
+       mock.module('node:fs', () => ({
+         ...fs,
+         linkSync: (stage) => {
+           for (const suffix of ['-journal', '-wal', '-shm'])
+             fs.writeFileSync(stage + suffix, 'synthetic sidecar');
+           throw new Error('synthetic unsupported publication');
+         },
+       }));
+       const { Ledger } = await import(${JSON.stringify(module)});
+       const { startupFailureCode, runBackup } = await import(${JSON.stringify(backupModule)});
+       try {
+         new Ledger(${JSON.stringify(config)}).close();
+         throw new Error('Expected startup to fail');
+       } catch (error) {
+         console.log(startupFailureCode(error));
+       }
+       process.exit(runBackup(${JSON.stringify(config.database)}, [${JSON.stringify(join(backups, 'manual.sqlite'))}]));`,
+    ],
+    { cwd: directory, encoding: 'utf8', timeout: 5000 },
+  );
+  expect(result.status).toBe(1);
+  expect(result.stdout.trim()).toBe('migration_backup_failed');
+  expect(JSON.parse(result.stderr)).toEqual({ event: 'backup_failed', code: 'backup_failed' });
+  expect(readdirSync(backups)).toEqual([other]);
+  expect(readFileSync(config.database)).toEqual(before);
+});
+
+test('a read-only backup bounds busy waiting and preserves the operational error code', () => {
+  const { config, directory } = fixture();
+  stageRuntime(directory);
+  setVersion(config, 5);
+  const writer = new Database(config.database);
+  try {
+    writer.exec('PRAGMA journal_mode=DELETE; BEGIN EXCLUSIVE');
+    const target = join(directory, 'manual.sqlite');
+    const started = performance.now();
+    const locked = runBackup(directory, config.database, target);
+    expect(locked.status).toBe(1);
+    expect(JSON.parse(locked.stderr)).toEqual({ event: 'backup_failed', code: 'backup_failed' });
+    expect(performance.now() - started).toBeGreaterThanOrEqual(1800);
+    expect(existsSync(target)).toBe(false);
+    writer.exec('ROLLBACK');
+    expect(runBackup(directory, config.database, target).status).toBe(0);
+  } finally {
+    writer.close();
+  }
+}, 10_000);
 
 test('preflight and operator backups follow SQLite paths through symlink parents', () => {
   const { config, directory, backups } = fixture();

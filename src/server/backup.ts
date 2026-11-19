@@ -1,4 +1,4 @@
-import { Database } from 'bun:sqlite';
+import { Database, SQLiteError } from 'bun:sqlite';
 import {
   closeSync,
   fsyncSync,
@@ -27,6 +27,7 @@ class BackupError extends Error {
     readonly code:
       | 'unsupported_database_format'
       | 'migration_backup_failed'
+      | 'backup_directory_unsafe'
       | 'backup_destination_exists',
     message: string,
   ) {
@@ -45,7 +46,11 @@ function destinationExists() {
 export function startupFailureCode(error: unknown) {
   // The Ledger runs inside the server bundle, with a separate copy of BackupError.
   if (error instanceof Error && 'code' in error) {
-    if (error.code === 'unsupported_database_format' || error.code === 'migration_backup_failed')
+    if (
+      error.code === 'unsupported_database_format' ||
+      error.code === 'migration_backup_failed' ||
+      error.code === 'backup_directory_unsafe'
+    )
       return error.code;
   }
   return 'initialization_failed';
@@ -53,6 +58,24 @@ export function startupFailureCode(error: unknown) {
 
 export function readDatabaseVersion(db: Database) {
   return db.query<{ user_version: number }, []>('PRAGMA user_version').get()!.user_version;
+}
+
+function withReadOnlySource<T>(path: string, use: (source: Database, version: number) => T) {
+  let source: Database | undefined;
+  try {
+    let version: number;
+    try {
+      source = new Database(path, { readonly: true, strict: true });
+      source.exec('PRAGMA busy_timeout=2000');
+      version = readDatabaseVersion(source);
+    } catch (error) {
+      if (error instanceof SQLiteError && error.code === 'SQLITE_NOTADB') throw unsupportedFormat();
+      throw error;
+    }
+    return use(source, version);
+  } finally {
+    source?.close();
+  }
 }
 
 function syncPath(path: string) {
@@ -65,12 +88,34 @@ function syncPath(path: string) {
 }
 
 function automaticDirectory(directory: string) {
-  mkdirSync(directory, { recursive: true, mode: 0o700 });
-  const entry = lstatSync(directory);
+  let entry = lstatSync(directory, { throwIfNoEntry: false });
+  if (!entry) {
+    try {
+      mkdirSync(directory, { mode: 0o700 });
+    } catch (error) {
+      if (!(error instanceof Error && 'code' in error && error.code === 'EEXIST')) throw error;
+    }
+    entry = lstatSync(directory);
+  }
   if (!entry.isDirectory() || (entry.mode & 0o777) !== 0o700)
-    throw new Error('Backup directory must allow private read and write access');
+    throw new BackupError(
+      'backup_directory_unsafe',
+      'Backup directory must be an actual directory with mode 0700',
+    );
   syncPath(dirname(directory));
   return directory;
+}
+
+function removeStaging(temporary: string) {
+  let failure: unknown;
+  for (const suffix of ['', ...sidecars]) {
+    try {
+      rmSync(temporary + suffix, { force: true });
+    } catch (error) {
+      failure ??= error;
+    }
+  }
+  if (failure) throw failure;
 }
 
 function publishSnapshot(
@@ -111,12 +156,17 @@ function publishSnapshot(
       throw error;
     }
   } finally {
-    rmSync(temporary, { force: true });
+    removeStaging(temporary);
   }
   syncPath(directory);
 }
 
-export function backupOpenDatabase(source: Database, destination: string, database: string) {
+export function backupOpenDatabase(
+  source: Database,
+  destination: string,
+  database: string,
+  version?: number,
+) {
   if (lstatSync(destination, { throwIfNoEntry: false })) throw destinationExists();
   const name = basename(destination);
   const path = join(realpathSync.native(dirname(destination)), name);
@@ -130,7 +180,7 @@ export function backupOpenDatabase(source: Database, destination: string, databa
     if (sourcePaths.some((file) => sidecars.some((suffix) => path === file + suffix)))
       throw new Error('Reserved backup destination');
   }
-  publishSnapshot(source, path, readDatabaseVersion(source));
+  publishSnapshot(source, path, version ?? readDatabaseVersion(source));
 }
 
 function isOwnedPrivateFile(path: string) {
@@ -169,7 +219,8 @@ function snapshotBeforeMigration(source: Database, database: string, version: nu
       .sort((a, b) => b.time.localeCompare(a.time));
     for (const { entry } of prior.slice(1)) rmSync(join(directory, entry), { force: true });
     syncPath(directory);
-  } catch {
+  } catch (error) {
+    if (error instanceof BackupError && error.code === 'backup_directory_unsafe') throw error;
     throw new BackupError('migration_backup_failed', 'Pre-migration backup failed');
   }
 }
@@ -186,18 +237,14 @@ export function prepareDatabase(database: string, currentVersion: number) {
     return 0;
   }
 
-  const source = new Database(database, { readonly: true, strict: true });
-  try {
-    const version = readDatabaseVersion(source);
+  return withReadOnlySource(database, (source, version) => {
     if (version !== currentVersion && (version < 2 || version > 6)) throw unsupportedFormat();
     const vacuum = source.query<{ auto_vacuum: number }, []>('PRAGMA auto_vacuum').get();
     if (vacuum?.auto_vacuum !== 2)
       throw new Error('Database requires auto_vacuum=INCREMENTAL; migrate offline');
     if (version !== currentVersion) snapshotBeforeMigration(source, database, version);
     return version;
-  } finally {
-    source.close();
-  }
+  });
 }
 
 function backupDatabase(database: string, target: string) {
@@ -206,20 +253,19 @@ function backupDatabase(database: string, target: string) {
   const sourceFile = statSync(sourcePath);
   if (!sourceFile.isFile() || !sourceFile.size) throw new Error('Backup source must be a database');
 
-  if (lstatSync(target, { throwIfNoEntry: false })) throw destinationExists();
-  const parent = dirname(target);
+  let parent = dirname(target);
+  // A trailing "/." still selects the default directory. Keep ".." for filesystem traversal.
+  while (parent !== '.' && basename(parent) === '.') parent = dirname(parent);
   if (basename(parent) === 'backups') {
     const databaseDirectory = realpathSync.native(dirname(database));
     if (realpathSync.native(dirname(parent)) === databaseDirectory)
       automaticDirectory(join(databaseDirectory, 'backups'));
   }
 
-  const source = new Database(sourcePath, { readonly: true, strict: true });
-  try {
-    backupOpenDatabase(source, target, database);
-  } finally {
-    source.close();
-  }
+  if (lstatSync(target, { throwIfNoEntry: false })) throw destinationExists();
+  withReadOnlySource(sourcePath, (source, version) => {
+    backupOpenDatabase(source, target, database, version);
+  });
 }
 
 export function runBackup(database: string, args: string[]) {
