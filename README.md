@@ -1,122 +1,114 @@
 # ContextLedger
 
-给 [new-api](https://github.com/QuantumNous/new-api) 用的对话记录本。
+面向 [new-api](https://github.com/QuantumNous/new-api) 的自托管对话审计与上下文归档系统。
 
-new-api 自带的日志只记「谁、什么时候、用了多少 token」，不记聊了什么。ContextLedger 把每次请求和回复的内容存下来，管理员可以在网页上翻看：用户发了什么，模型回了什么。
-
-## 由两部分组成
-
-- **插件**（[plugins/ca11back_contextledger/plugin.js](plugins/ca11back_contextledger/plugin.js)）：装在 new-api 里。每次请求结束，它把内容整理一下，发给记录服务。
-- **记录服务**：一个独立的小程序，负责收、存，并提供一个只有管理员能登录的网页。
-
-## 存哪些内容
-
-插件会先把内容精简一下，只留人看得懂、有审计价值的部分：
-
-- **加密字段不存**。像 `encrypted_content` 这种，人看不懂，也没法审计。
-- **Responses 流式回复优先存最终结果**。只要能验证最终回复覆盖了中间片段，就保存最终版；无法验证时保留收到的事件。其他协议的流式内容在网页读取时拼接展示。
-- **图片不存原图**。new-api 自己会把图片换成 `[media:N]` 这样的占位符。
-
-## 大对话怎么传
-
-长对话每次请求都会把之前的聊天记录整个带上，越聊越大。如果每次都整个重传，既慢又占空间。所以：
-
-1. 插件先把内容切成小块，给每块算一个「指纹」，然后只把指纹清单发过去。
-2. 记录服务对照一下，回复「这几块我还没有」。
-3. 插件只补传缺的那几块。
-
-聊得越久，之前的内容大多已经存过，每次要补传的就越少。相同的内容在库里也只存一份，再用 zstd 压缩。
-
-**关于大小限制**：不是说一条记录最大只能 1 MiB。new-api 限制插件每次请求最多发 4 次 HTTP 请求，每次最多 1 MiB。所以插件每次最多先发 1 次清单，再补传 3 批内容，也就是一次最多补传约 3 MiB 的**新**内容。
-
-如果一段全新的对话一上来就超过这个量，这次只能先传一部分，网页上会标成「没传完」。同一段对话的下一次请求会接着补，补齐了就自动变成完整记录。没传完的记录最多保留 1 小时，期间一直没人补齐就作废。
-
-## 可能漏记的情况
-
-- new-api 本身最多只截取约 1 MiB 的回复内容交给插件。这是 new-api 的限制，超出的部分插件拿不到，跟上面说的上传方式无关。
-- 网关太忙、重启或者网络出错时，个别请求可能漏记。
-- 存下来的是插件整理后发过来的内容，不是网关上原始的网络数据。
-
-没传完的记录会单独列出来，不会冒充完整记录。
-
-## 网页怎么看
-
-网页默认按会话阅读，也可以切到请求列表，或粘贴 new-api 的请求编号直接定位。
-
-- Codex 请求体带有线程声明时，同一线程的上下文压缩会保留在原线程组里，并标记上下文变化；内容分叉单独展示来源。
-- 客户端明确声明的子代理会显示父线程和名称，不从聊天内容猜测代理关系。
-- 其他客户端按可验证的内容前缀连接；无法确定时另开会话，因此可能出现断开的记录。
-- OpenAI Chat、Responses、Claude 和 Gemini 的可识别回复显示为消息、工具调用和工具结果。不完整或异常的回复会单独标记。
-- 每轮的「原始数据」可以分段查看实际存下来的内容。图片只显示占位或描述，日志里的远程资源不会自动加载。
-- 失败或被重试取代的轮次默认收起成一行；连续的空思考记录合并成一行。
-
-以下截图全部使用虚构的演示数据。
-
-**会话阅读**：左侧会话列表，右侧按轮次阅读。竖线上的支线是内容分叉，失败后被重试的轮次收起成一行。
+new-api 原生日志仅记录调用元数据（用户、时间、模型与 token 消耗），不保存实际交互内容。ContextLedger 在网关请求结束时捕获并整理完整的请求与回复，经内容寻址去重与压缩后归档至本地 SQLite，提供仅供管理员访问的会话级审计界面。
 
 ![会话阅读](docs/screenshots/conversation.png)
 
-**按请求编号定位**：粘贴请求编号直接跳到那一轮并高亮，上方标出上下文发生变化的位置。
+> 文中界面截图均基于虚构演示数据生成。
 
+## 架构概览
+
+ContextLedger 由采集插件与独立记录服务两部分协作运行，客户端无需做任何改动：
+
+| 组件 | 位置 / 交付物 | 职责 |
+| :--- | :--- | :--- |
+| **采集插件** | [plugins/ca11back\_contextledger/plugin.js](plugins/ca11back_contextledger/plugin.js) | 安装于 new-api 内（插件 key 为 `ca11back_contextledger`，v0.3.0），在请求完成后清洗不可审计字段，以分块增量协议推送至服务端。 |
+| **记录服务** | `ghcr.io/ca11back/contextledger:0.3`（`amd64` / `arm64`） | 独立的单进程服务（v0.3.0），负责鉴权接收、分块去重与 zstd 压缩落库、会话拓扑还原、容量配额淘汰以及管理员 Web 控制台。 |
+
+## 核心特性
+
+### 审计阅读与会话还原
+
+控制台默认以**会话视角**呈现记录，同时支持切换为**单条请求列表**，或直接粘贴 new-api 的 **Request ID** 精确定位到对应轮次，并按用户、令牌、模型及状态（主对话、子代理、报错、回复不完整、含图片）快速筛选。
+
+- **多协议结构化解析**：识别 OpenAI Chat、OpenAI Responses、Claude 与 Gemini 协议，将消息正文、工具调用与工具返回渲染为结构化视图，异常或残缺回复独立标注。
+- **确定性线程、分叉与子代理关联**：
+  - 对携带显式线程声明的 Codex 请求，同一线程内的上下文压缩仍归属原线程并标出变化位置，内容分叉独立展示来源分支。
+  - 对客户端明确声明的子代理，关联展示父线程与代理名称，不基于对话文本做启发式猜测。
+  - 其他客户端按可验证的内容前缀串联会话；前缀无法确认时另起新会话，宁可断开也不误拼。
+- **阅读降噪与原始核验**：失败或已被后续重试取代的轮次默认折叠为单行，连续空思考自动合并；每轮均可按段展开「原始数据」核对落库原文。图片仅展示占位符或描述，不会自动加载日志中的外部远程资源。
+
+**按请求编号定位**：粘贴 Request ID 直达目标轮次并高亮显示，同时标出上下文发生变化的节点。
 ![按请求编号定位](docs/screenshots/anchored.png)
 
-**请求列表**：按单条请求排查，图片只显示遮罩占位，不加载远程资源。
 
+**单条请求排查**：按请求维度逐条检视详情，图片仅显示遮罩占位，杜绝外链资源自动加载。
 ![请求列表](docs/screenshots/requests.png)
 
-## 空间管理
 
-设一个总容量上限，比如 10 GB。快满了就从最旧的记录开始删，不用手动清理。
+### 增量分块传输与去重存储
 
-## 本地运行
+长对话在每轮请求中都会重复携带历史上下文，直接全量上报既耗带宽又占磁盘。ContextLedger 采用内容寻址机制解决这一问题：
 
-需要 [Bun](https://bun.sh) 1.4.4。
+1. **采集端精简**：剔除 `encrypted_content` 等无法人工审计的加密字段；OpenAI Responses 流式响应在可验证终态完整覆盖中间事件时仅保留最终结果（无法验证则保留完整事件流），其他协议流式内容在阅读时拼接还原；图片已由 new-api 替换为 `[media:N]` 占位符，不存原图；不采集插件配置、请求头与 Embedding 请求（`format=embedding`）。
+2. **指纹协商与差量补传**：插件将内容切片并计算 SHA-256 指纹清单先行上报，服务端比对后仅返回缺失块列表，插件只需补传新增分块。对话越长，单轮增量越小。
+3. **全局去重与自动配额淘汰**：相同内容块在 SQLite 中仅存一份并经 `zstd` 压缩。通过 `LEDGER_MAX_STORAGE_MB` 设定数据库容量上限（例如 `10000` 即 10 GB），逼近阈值时自动从最旧记录开始淘汰，无需人工维护；亦可选配 `LEDGER_MAX_AGE_DAYS` 限定最长保留天数。
+
+> **关于单次传输上限**：new-api 限制插件单次请求最多发起 4 次 HTTP 调用、每次上限 1 MiB。借助指纹协商，插件以「1 次清单 + 最多 3 批分块」的方式，单次可补传约 **3 MiB 的新增内容**（而非整条记录上限 1 MiB）。若全新超长对话单次未能传完，系统会将其标记为「未完整采集」，由同一对话的后续请求继续补齐；超过 1 小时仍未补齐的残缺记录会自动作废。
+
+## 快速接入（推荐 Docker 部署）
+
+生产环境建议将 ContextLedger 与 new-api 置于同一 Docker 网络内，通过内网地址通信。完整的镜像标签说明、升级与回滚、热/冷备份及全量配置项请参阅 [部署与运维文档](deploy/README.md)。
+
+1. **部署记录服务**：参考 [deploy/README.md](deploy/README.md) 中的快速开始步骤，准备 `ledger.env`（权限设为 `0600`）并使用镜像 `ghcr.io/ca11back/contextledger:0.3` 启动容器。
+2. **安装 new-api 插件**：在 new-api 后台插件市场搜索并安装 ContextLedger；或前往「插件」页面手动上传 [plugins/ca11back\_contextledger/plugin.js](plugins/ca11back_contextledger/plugin.js) 与同目录的 `icon.png`（已在 new-api `v1.0.0-rc.51` 验证）。
+3. **配置请求处理实例**：新建实例并填写以下三项配置，按需设定生效范围后启用：
+
+| 插件配置项 | 说明 | 示例 |
+| :--- | :--- | :--- |
+| `url` | 记录服务接收地址 | `http://contextledger:3000/api/ingest` |
+| `token` | 与服务端一致的 `LEDGER_INGEST_TOKEN` | 至少 24 位随机字符串 |
+| `source` | 与服务端一致的 `LEDGER_SOURCE` | `new-api` |
+
+4. **访问审计台**：在宿主机打开映射端口（或通过 SSH 端口转发到本地），使用默认账号 `admin` 及 `LEDGER_ADMIN_PASSWORD` 登录。
+
+插件面向 new-api 市场的独立说明与变更记录见 [plugins/ca11back\_contextledger/README.zh-CN.md](plugins/ca11back_contextledger/README.zh-CN.md) 与 [CHANGELOG.zh-CN.md](plugins/ca11back_contextledger/CHANGELOG.zh-CN.md)。
+
+## 本地开发与运行
+
+运行环境需要 [Bun](https://bun.sh) `1.4.4`。
 
 ```sh
 bun install --frozen-lockfile
-bun run check   # 代码检查、类型检查、测试、构建，一次跑完
+bun run check   # 依次执行代码检查、类型检查、单元测试、构建与客户端边界审计
 ```
 
-新建一个 `.env` 文件，不要提交到仓库。密码和令牌自己生成，两个不能一样：
+在项目根目录创建 `.env`（切勿提交至版本库），确保管理员密码与上传令牌彼此不同：
 
-```text
-LEDGER_SOURCE=my-gateway                # 数据来源名，随便起
-LEDGER_MAX_STORAGE_MB=10000             # 容量上限，10000 MB 就是 10 GB
-LEDGER_ADMIN_PASSWORD=<至少 16 个字符>   # 登录网页用
-LEDGER_INGEST_TOKEN=<至少 24 个字符>     # 插件上传用
+```dotenv
+LEDGER_SOURCE=my-gateway                # 数据来源标识，需与插件配置一致
+LEDGER_MAX_STORAGE_MB=10000             # 数据库容量上限（十进制 MB，10000 = 10 GB）
+LEDGER_ADMIN_PASSWORD=<至少 16 个字符>   # 控制台登录密码
+LEDGER_INGEST_TOKEN=<至少 24 个字符>     # 插件上传鉴权令牌
 LEDGER_HOST=127.0.0.1
 PORT=3000
 ```
 
-启动：
+启动服务：
 
 ```sh
 bun --env-file=.env run start
 ```
 
-浏览器打开 `http://127.0.0.1:3000/`，用户名 `admin`，密码就是上面设的那个。
+访问 `http://127.0.0.1:3000/`，默认用户名为 `admin`，密码为 `LEDGER_ADMIN_PASSWORD`。
 
-网页没考虑直接放到公网上，建议只在本机监听。要远程访问，可以用 SSH 端口转发。
+## 已知边界与安全提示
 
-## 接到 new-api 上
+- **上游截断上限**：new-api 传递给插件的响应体上限约为 1 MiB，超出部分插件侧无法获取，与 ContextLedger 的分块上传机制无关。
+- **弱一致采集边界**：当网关过载、重启或网络异常时，个别请求可能漏记。所有未传完的记录都会单独标识，绝不冒充完整记录。
+- **非原始抓包**：落库内容是插件清洗整理后的可读审计视图，不等同于网关层的原始网络报文。
+- **访问与数据安全**：数据库与备份包含完整对话内容（可能涉及用户隐私或敏感凭据），请严格收紧宿主机目录权限并告知用户。控制台默认设计为仅本机监听，不建议直接暴露至公网；远程访问请使用 SSH 端口转发，或在反向代理层自行配置 HTTPS 与额外访问控制。
+- **单进程约束**：同一 SQLite 数据库文件仅允许单个服务进程挂载，升级或维护时需先停止旧实例。
 
-1. 用现成的 Docker 镜像部署记录服务，放进 new-api 所在的 Docker 网络。步骤见 [deploy/README.md](deploy/README.md) 的「快速开始」。
-2. 在 new-api 后台从插件市场安装 ContextLedger；也可以在「插件」页面直接上传 [plugins/ca11back_contextledger/plugin.js](plugins/ca11back_contextledger/plugin.js)，同目录的 `icon.png` 作为图标。
-3. 新建一个请求处理实例，填三项：
-   - `url`：记录服务的接收地址，例如 `http://contextledger:3000/api/ingest`
-   - `token`：上面设的 `LEDGER_INGEST_TOKEN`
-   - `source`：和上面的 `LEDGER_SOURCE` 填一样的
-4. 启用实例。之后有请求经过，刷新记录服务的网页就能看到。
+## 技术栈与发版约定
 
-插件 key 是 `ca11back_contextledger`，版本 0.3.0，配合服务端 0.3.0 使用。插件目录里还有给 new-api 插件市场用的 [说明](plugins/ca11back_contextledger/README.zh-CN.md) 和 [更新日志](plugins/ca11back_contextledger/CHANGELOG.zh-CN.md)。
-
-## 更多
-
-Docker 部署、升级和回滚、备份、全部配置项，都在 [deploy/README.md](deploy/README.md)。
-
-技术栈：Bun、TanStack Start、React、Rsbuild、SQLite、zstd。
-
-发版：服务端打 `vX.Y.Z` tag 后，GitHub 自动构建镜像发到 GHCR；插件按 [new-api 官方插件约定](https://docs.newapi.ai/en/docs/plugins/development)发布，tag 是 `plugins/ca11back_contextledger/vX.Y.Z`。两边都要升级时，先发服务端，再发插件。
+- **技术栈**：Bun · TanStack Start · React · Rsbuild · SQLite · zstd
+- **发版流程**：
+  - 服务端推送 `vX.Y.Z` tag 后，由 GitHub Actions 自动构建并发布多架构镜像至 GHCR。
+  - 插件遵循 [new-api 官方插件约定](https://docs.newapi.ai/en/docs/plugins/development)发布，对应 tag 为 `plugins/ca11back_contextledger/vX.Y.Z`。
+  - 双端同时升级时，务必**先升级服务端，再升级插件**。
 
 ## 许可证
 
