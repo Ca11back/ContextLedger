@@ -116,6 +116,8 @@ bun --env-file=.env run start
 
 技术栈：Bun、TanStack Start、React、Rsbuild、SQLite、zstd。
 
+发版：服务端打 `vX.Y.Z` tag 后，GitHub 自动构建镜像发到 GHCR；插件按 [new-api 官方插件约定](https://docs.newapi.ai/en/docs/plugins/development)发布，tag 是 `plugins/ca11back_contextledger/vX.Y.Z`。两边都要升级时，先发服务端，再发插件。
+
 ## 许可证
 
 [MIT License](LICENSE) · Copyright (c) 2026 Ca11back
