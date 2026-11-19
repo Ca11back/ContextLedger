@@ -1,9 +1,9 @@
 import { Database } from 'bun:sqlite';
 import { afterEach, expect, test } from 'bun:test';
 import { spawnSync } from 'node:child_process';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdtempSync, readdirSync, rmSync, statSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import type { Envelope } from '../src/contracts';
 import { hash } from '../src/server/codec';
 import type { Config } from '../src/server/config';
@@ -918,6 +918,25 @@ test('schema5 migration backfills projected statistics from evidence with retain
 
   const reopened = store(c);
   expect(reopened.db.query('PRAGMA user_version').get()).toEqual({ user_version: 7 });
+  const backupDirectory = join(dirname(c.database), 'backups');
+  const backupNames = readdirSync(backupDirectory);
+  expect(backupNames).toHaveLength(1);
+  const backupPath = join(backupDirectory, backupNames[0]!);
+  expect(statSync(backupDirectory).mode & 0o777).toBe(0o700);
+  expect(statSync(backupPath).mode & 0o777).toBe(0o600);
+  const backup = new Database(backupPath, { readonly: true });
+  try {
+    expect(backup.query('PRAGMA user_version').get()).toEqual({ user_version: 5 });
+    expect(backup.query('PRAGMA quick_check').get()).toEqual({ quick_check: 'ok' });
+    expect(backup.query('SELECT * FROM requests').all()).toEqual(roots);
+    expect(backup.query('SELECT * FROM threads').all()).toEqual(threads);
+    expect(backup.query('SELECT * FROM objects ORDER BY hash').all()).toEqual(objects);
+    expect(backup.query('SELECT * FROM conversations WHERE id=?').get(a.conversation_id)).toEqual(
+      before,
+    );
+  } finally {
+    backup.close();
+  }
   expect(
     reopened.db.query(`SELECT ${Object.keys(roots[0] as object).join(',')} FROM requests`).all(),
   ).toEqual(roots);

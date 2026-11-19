@@ -53,7 +53,9 @@ test('standalone bootstrap exits before listening if the database cannot open', 
     const dist = join(directory, 'dist/server');
     mkdirSync(dist, { recursive: true });
     writeFileSync(join(dist, 'index.js'), `export { default } from ${JSON.stringify(entry)};`);
-    copyFileSync(new URL('../server.ts', import.meta.url), join(directory, 'server.ts'));
+    mkdirSync(join(directory, 'src/server'), { recursive: true });
+    for (const path of ['server.ts', 'src/server/backup.ts', 'src/server/config.ts'])
+      copyFileSync(new URL(`../${path}`, import.meta.url), join(directory, path));
     const file = join(directory, 'synthetic-private-path');
     writeFileSync(file, 'plain file');
     const result = spawnSync(process.execPath, ['--no-env-file', 'run', 'server.ts'], {

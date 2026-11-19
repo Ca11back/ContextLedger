@@ -1,5 +1,5 @@
 import { Database } from 'bun:sqlite';
-import { existsSync } from 'node:fs';
+import { backupOpenDatabase } from '../src/server/backup';
 import { loadConfig } from '../src/server/config';
 import { SCHEMA_VERSION } from '../src/server/linking';
 import { Ledger } from '../src/server/storage';
@@ -26,10 +26,9 @@ if (args.includes('--help')) {
     const destination = args[backupAt + 1];
     if (!destination || destination.startsWith('--'))
       throw new Error('Supply --backup destination');
-    if (existsSync(destination)) throw new Error('Backup destination exists');
     const source = new Database(config.database, { readonly: true, strict: true });
     try {
-      source.query('VACUUM INTO ?').run(destination);
+      backupOpenDatabase(source, destination, config.database);
     } finally {
       source.close();
     }

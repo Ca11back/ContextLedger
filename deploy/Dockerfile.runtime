@@ -3,6 +3,7 @@ FROM ${BUN_IMAGE}
 WORKDIR /app
 COPY dist ./dist
 COPY server.ts ./server.ts
+COPY src/server ./src/server
 COPY LICENSE ./LICENSE
 COPY artifact-manifest.json ./artifact-manifest.json
 RUN mkdir -p /data && chown bun:bun /data

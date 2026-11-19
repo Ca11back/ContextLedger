@@ -1,7 +1,8 @@
 import { Database } from 'bun:sqlite';
-import { existsSync, mkdirSync, statSync } from 'node:fs';
-import { dirname, resolve } from 'node:path';
+import { mkdirSync, statSync } from 'node:fs';
+import { dirname } from 'node:path';
 import { type Envelope, metadata, object, type RecordMeta } from '../contracts';
+import { backupOpenDatabase, prepareDatabase, readDatabaseVersion } from './backup';
 import { decodeParts, hash, type Prepared, prepare, verify } from './codec';
 import type { Config } from './config';
 import { LedgerError } from './errors';
@@ -47,30 +48,23 @@ export class Ledger {
   private pending = 0;
   private queue: Promise<unknown> = Promise.resolve();
   constructor(readonly config: Config) {
-    if (config.database !== ':memory:')
-      mkdirSync(dirname(resolve(config.database)), { recursive: true, mode: 0o700 });
-    const fresh = config.database === ':memory:' || !existsSync(config.database);
+    const version = prepareDatabase(config.database, SCHEMA_VERSION);
+    if (version === 0 && config.database !== ':memory:')
+      mkdirSync(dirname(config.database), { recursive: true, mode: 0o700 });
     this.db = new Database(config.database, { create: true, strict: true });
-    if (fresh) this.db.exec('PRAGMA auto_vacuum=INCREMENTAL');
-    if (
-      Number((this.db.query('PRAGMA auto_vacuum').get() as { auto_vacuum: number }).auto_vacuum) !==
-      2
-    )
-      throw new Error('Database requires auto_vacuum=INCREMENTAL; migrate offline');
-    this.db.exec(
-      'PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; PRAGMA foreign_keys=ON; PRAGMA busy_timeout=2000; PRAGMA wal_autocheckpoint=128; PRAGMA journal_size_limit=1048576',
-    );
-    if (
-      config.database !== ':memory:' &&
-      (this.db.query('PRAGMA journal_mode').get() as { journal_mode: string }).journal_mode !==
-        'wal'
-    )
-      throw new Error('Database requires WAL mode');
-    const version = (this.db.query('PRAGMA user_version').get() as { user_version: number })
-      .user_version;
-    if (![0, 2, 3, 4, 5, 6, SCHEMA_VERSION].includes(version))
-      throw new Error('Unsupported database format');
-    this.db.exec(`CREATE TABLE IF NOT EXISTS requests (
+    try {
+      if (readDatabaseVersion(this.db) !== version) throw new Error('Database version changed');
+      if (version === 0) this.db.exec('PRAGMA auto_vacuum=INCREMENTAL');
+      const vacuum = this.db.query<{ auto_vacuum: number }, []>('PRAGMA auto_vacuum').get();
+      if (vacuum?.auto_vacuum !== 2)
+        throw new Error('Database requires auto_vacuum=INCREMENTAL; migrate offline');
+      this.db.exec(
+        'PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; PRAGMA foreign_keys=ON; PRAGMA busy_timeout=2000; PRAGMA wal_autocheckpoint=128; PRAGMA journal_size_limit=1048576',
+      );
+      const journal = this.db.query<{ journal_mode: string }, []>('PRAGMA journal_mode').get();
+      if (config.database !== ':memory:' && journal?.journal_mode !== 'wal')
+        throw new Error('Database requires WAL mode');
+      this.db.exec(`CREATE TABLE IF NOT EXISTS requests (
       id INTEGER PRIMARY KEY AUTOINCREMENT, received_at INTEGER NOT NULL, source TEXT NOT NULL, upload_id TEXT NOT NULL,
       host_request_id TEXT NOT NULL, model TEXT NOT NULL, channel TEXT NOT NULL, user_label TEXT NOT NULL, token_label TEXT NOT NULL,
       outcome TEXT NOT NULL, truncated INTEGER NOT NULL, media INTEGER NOT NULL, duration_ms REAL,
@@ -93,7 +87,6 @@ export class Ledger {
       CREATE TABLE IF NOT EXISTS pending_pins(upload_id TEXT NOT NULL REFERENCES uploads(upload_id) ON DELETE CASCADE, hash TEXT NOT NULL, length INTEGER NOT NULL, idx INTEGER NOT NULL, priority INTEGER NOT NULL, PRIMARY KEY(upload_id,hash));
       CREATE INDEX IF NOT EXISTS pending_pins_hash ON pending_pins(hash);
       `);
-    try {
       if (version === 2 || version === 3 || version === 4)
         backfillConversations(this.db, (id) => this.restore(id));
       else if (version === 5 || version === 6) backfillSearches(this.db, (id) => this.restore(id));
@@ -629,8 +622,7 @@ export class Ledger {
     backfillConversations(this.db, (id) => this.restore(id));
   }
   backup(destination: string) {
-    if (existsSync(destination)) throw new Error('Backup destination exists');
-    this.db.query('VACUUM INTO ?').run(destination);
+    backupOpenDatabase(this.db, destination, this.config.database);
   }
   close() {
     this.db.close();

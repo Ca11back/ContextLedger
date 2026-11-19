@@ -1,14 +1,18 @@
 import { cp, mkdir, readdir, readFile, writeFile } from 'node:fs/promises';
-import { join, relative, resolve } from 'node:path';
+import { dirname, join, relative, resolve } from 'node:path';
 import { hash } from '../src/server/codec';
 
 const argument = process.argv.indexOf('--output');
 if (argument < 0 || !process.argv[argument + 1])
   throw new Error('Supply --output artifacts/version (must not exist)');
 const destination = resolve(process.argv[argument + 1]!);
+await mkdir(dirname(destination), { recursive: true });
 await mkdir(destination, { recursive: false });
 await cp('dist', join(destination, 'dist'), { recursive: true });
 await cp('server.ts', join(destination, 'server.ts'));
+await mkdir(join(destination, 'src/server'), { recursive: true });
+for (const path of ['src/server/backup.ts', 'src/server/config.ts'])
+  await cp(path, join(destination, path));
 await cp('LICENSE', join(destination, 'LICENSE'));
 await cp('deploy/Dockerfile.runtime', join(destination, 'Dockerfile'));
 async function files(path: string): Promise<string[]> {
@@ -27,6 +31,7 @@ const sources = [
   'bun.lock',
   'rsbuild.config.ts',
   'scripts/client-boundary.ts',
+  'scripts/package-runtime.ts',
   'biome.json',
   'tsconfig.json',
   'deploy/Dockerfile.runtime',

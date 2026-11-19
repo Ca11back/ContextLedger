@@ -10,6 +10,10 @@ export interface Config {
   reserveBytes: number;
   maintenanceMs: number;
 }
+export function databasePath(env: Record<string, string | undefined> = process.env) {
+  return env.LEDGER_DATABASE ?? './data/ledger.sqlite';
+}
+
 export function loadConfig(env: Record<string, string | undefined> = process.env): Config {
   const required = (key: string) => {
     const value = env[key];
@@ -33,7 +37,7 @@ export function loadConfig(env: Record<string, string | undefined> = process.env
     Math.max(256 * 1024, Math.min(8 * 1024 * 1024, Math.floor(maxStorageBytes / 10))),
   );
   const config = {
-    database: env.LEDGER_DATABASE ?? './data/ledger.sqlite',
+    database: databasePath(env),
     maxStorageBytes,
     maxBodyBytes,
     reserveBytes,

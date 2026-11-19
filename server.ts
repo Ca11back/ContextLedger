@@ -1,11 +1,16 @@
 import { resolve, sep } from 'node:path';
+import { runBackup, startupFailureCode } from './src/server/backup';
+import { databasePath } from './src/server/config';
+
+const [command, ...args] = process.argv.slice(2);
+if (command === 'backup') process.exit(runBackup(databasePath(), args));
 
 let app: typeof import('./src/server').default;
 try {
   ({ default: app } = await import('./dist/server/index.js' as string));
   await app.initialize();
-} catch {
-  console.error(JSON.stringify({ event: 'startup_failed', code: 'initialization_failed' }));
+} catch (error) {
+  console.error(JSON.stringify({ event: 'startup_failed', code: startupFailureCode(error) }));
   process.exit(1);
 }
 const publicRoot = resolve('dist/client');
