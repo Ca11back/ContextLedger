@@ -110,20 +110,23 @@ ssh -N -L 18740:127.0.0.1:18740 <你的服务器>
 ### 回滚
 
 - **数据库格式没变**：把 `image` 改回记下的旧版本，`docker compose up -d --no-deps contextledger`。
-- **数据库格式变了**：旧版本读不了新格式，要用升级前的备份。路径按你的挂载目录调整：
+- **数据库格式变了**：旧版本读不了新格式，要用升级前的备份。先把 compose 里的 `image` 改回记下的旧版本，再把下面的内容保存成 `rollback.sh`，按你的挂载目录和备份文件名改好路径，用 `bash rollback.sh` 运行。任何一步失败都会停下，不会启动一个空库。不要直接粘贴进终端，`set -e` 出错时会关掉当前终端。
 
   ```sh
+  set -eu
   data=contextledger/data
   snapshot="$data/backups/ledger-schema7-20261119T010000Z.sqlite"   # 换成实际要恢复的备份
-  keep="$data/upgraded-$(date +%Y%m%d%H%M%S)"                        # 升级后的数据先移到这里留着
+  sudo test -s "$snapshot"                                           # 文件不存在或为空就停下
 
   docker compose stop contextledger
-  sudo install -d -m 700 -o 1000 -g 1000 "$keep"
+  ready="$data/.restore-$(date +%s).sqlite"
+  sudo install -m 600 -o 1000 -g 1000 "$snapshot" "$ready"           # 先复制好，失败不动当前库
+  keep=$(sudo mktemp -d "$data/upgraded-XXXXXXXX")                   # 升级后的数据移到这里留着
+  sudo chown 1000:1000 "$keep"
   for f in ledger.sqlite ledger.sqlite-wal ledger.sqlite-shm ledger.sqlite-journal; do
-    sudo test -e "$data/$f" && sudo mv "$data/$f" "$keep/"
+    if sudo test -e "$data/$f"; then sudo mv "$data/$f" "$keep/"; fi
   done
-  sudo install -m 600 -o 1000 -g 1000 "$snapshot" "$data/ledger.sqlite"
-  # 把 compose 里的 image 改回记下的旧版本
+  sudo mv "$ready" "$data/ledger.sqlite"
   docker compose up -d --no-deps contextledger
   docker compose ps contextledger
   ```
@@ -145,6 +148,7 @@ docker compose run --rm --no-deps contextledger bun run server.ts backup /data/b
 ```
 
 - 每次用新文件名，目标已存在会拒绝（`backup_destination_exists`）。
+- 备份被强行中断（比如容器被杀、断电）时可能留下 `.contextledger-backup-*.tmp` 文件。确认没有备份命令在运行后，可以把它和同名的 `-wal`、`-shm` 文件一起删掉。
 - 运行时备份期间数据库没法整理日志文件，流量大时可能有几条上传被暂时拒绝（HTTP 507）而漏记。尽量挑空闲时段；不能接受漏记的话，停服务再备份。
 - `backups` 目录权限必须是 700，服务会自动创建。自动备份（升级前那种）只保留最近两份；手动备份不会自动删除，自己清理。
 - 备份里是完整的对话内容，和数据库一样要保管好。
